@@ -19,7 +19,8 @@ wget https://github.com/tomnguyen4/GRNPred/releases/download/Data/v1.0.0/text_de
 ```
 ## How to Run
 
-Run the main script and provide the 3 required input paths:
+Run the main script and provide the 3 required input paths.  
+The `main.py` will automatically load the data, split edges into 70/15/15 (train/val/test), train the model, and then run final evaluation on the full test split.
 
 ```bash
 python main.py \
