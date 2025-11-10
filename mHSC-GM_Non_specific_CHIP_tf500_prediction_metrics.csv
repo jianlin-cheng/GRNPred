@@ -1,8 +1,0 @@
-Metric,Mean
-Accuracy,0.871
-Precision,0.8513
-Recall,0.9043
-F1 Score,0.876
-ROC AUC,0.9233
-Average Precision,0.9254
-Jaccard Index,0.7803
