@@ -2,6 +2,10 @@
 AI methods for predicting gene regulatory networks from omics data.
 
 ---
+# GRNPred
+Machine learning framework for predicting gene regulatory networks (GRNs) from multi-omics data.
+
+---
 
 ## How to Run
 
@@ -15,8 +19,8 @@ python main.py \
 
 Required Supporting Files
 
-Ensure the following files are also available in the same working directory
-(or specify their paths with --priors_path / --tf_bind_path / etc.):
+These must also be present in the same working directory
+(or specify their paths via --priors_path, --tf_bind_path, etc.):
 
 gene_go_pairs.csv
 
