@@ -16,11 +16,11 @@ python main.py \
   --expr_path mESC_Non_specific_CHIP_tf500_ExpressionData.csv \
   --label_path mESC_Non_specific_CHIP_tf500_refNetwork.csv \
   --tf_path mESC_Non_specific_CHIP_tf500_TFs.csv
+```
 
 Required Supporting Files
 
-These must also be present in the same working directory
-(or specify their paths via --priors_path, --tf_bind_path, etc.):
+These must be present in the working directory (or provided via flags like --priors_path, --tf_bind_path, etc.):
 
 gene_go_pairs.csv
 
