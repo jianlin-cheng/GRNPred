@@ -9,6 +9,7 @@ import argparse
 import numpy as np
 import torch
 from torch_geometric.utils import k_hop_subgraph
+import re
 
 def seed_everything(seed: int = 42):
     """
@@ -60,7 +61,8 @@ def parse_args():
     p.add_argument("--expr_path",  required=True, help="Path to <BASE>_ExpressionData.csv")
     p.add_argument("--label_path", required=True, help="Path to <BASE>_refNetwork.csv")
     p.add_argument("--tf_path",    required=True, help="Path to <BASE>_TFs.csv")
-    # OPTIONAL (with sensible defaults)
+
+    # OPTIONAL
     p.add_argument("--priors_path",   default="gene_go_pairs.csv",
                    help="Path to gene_go_pairs.csv (default: gene_go_pairs.csv)")
     p.add_argument("--tf_bind_path",  default="tf_binding_logodds.csv",
@@ -75,20 +77,54 @@ def parse_args():
     p.add_argument("--num_layers",     type=int,   default=1)
     p.add_argument("--dropout",        type=float, default=0.1)
     p.add_argument("--base_name",      default=None,
-                   help="Base name for checkpoints/outputs; default: expr file stem")
+                   help="Base name for checkpoints/outputs; default: derived from expr file stem")
     return p.parse_args()
 
+def infer_base_name(expr_path: str, label_path: str, tf_path: str, explicit: str | None = None) -> str:
+    if explicit:
+        return explicit
+
+    def stem(p: str) -> str:
+        return os.path.splitext(os.path.basename(p))[0]
+
+    def strip_known_expr(s: str) -> str:
+        for suf in ["_ExpressionData", "_Expression", "_expr", "_EXP", "_exp"]:
+            if s.endswith(suf):
+                return s[: -len(suf)]
+        return s
+
+    def strip_known_label(s: str) -> str:
+        return re.sub(r"_refNetwork$", "", s)
+
+    def strip_known_tf(s: str) -> str:
+        return re.sub(r"_TFs?$", "", s)
+
+    s1 = strip_known_expr(stem(expr_path))
+    s2 = strip_known_label(stem(label_path))
+    s3 = strip_known_tf(stem(tf_path))
+
+    # Prefer a token-wise common prefix; fall back to expr-derived name
+    t1, t2, t3 = s1.split("_"), s2.split("_"), s3.split("_")
+    common = []
+    for a, b, c in zip(t1, t2, t3):
+        if a == b == c:
+            common.append(a)
+        else:
+            break
+    return "_".join(common) if common else s1
 
 def main():
     args = parse_args()
+    seed_everything(42)
 
     device = torch.device(args.device)
     print(f"Using device: {device}\n")
 
-    # Derive a base name for artifacts
-    base_name = args.base_name or os.path.splitext(os.path.basename(args.expr_path))[0]
+    # derive clean base name
+    base_name = infer_base_name(args.expr_path, args.label_path, args.tf_path, args.base_name)
+    print(f"[INFO] Base name: {base_name}")
 
-    # Build model (GraphTransformer loads data internally in your setup)
+    # Build model (GraphTransformer loads data internally)
     model = GraphTransformer(
         args.expr_path,
         args.label_path,
@@ -107,15 +143,15 @@ def main():
           f"num_layers={len(model.convs)} "
           f"dropout={model.dropout}")
 
-    # Sanitize and prep
+    # sanitize and prep data
     g_main = _sanitize_graph(model.data)
     ensure_pos_emb_capacity(model, g_main.x.size(0))
 
-    # Build TF-centric subgraphs/pools
+    # build TF-centric subgraphs/pools
     tf_subgraphs = extract_tf_subgraphs(g_main, num_hops=args.hops_tf)
     train_tf_pools = [tf_subgraphs]
 
-    # ───────────────────────────── Stage A: Pretraining ─────────────────────────────
+    # ─────────────── Stage A: Pretraining ───────────────
     if hasattr(model, "classifier"):
         for p in model.classifier.parameters(): p.requires_grad = False
     if hasattr(model, "bilin"):
@@ -133,8 +169,7 @@ def main():
         w_mse=1.0, w_pcc=1.0, base_lr=model.lr, wd=1e-4
     )
 
-
-    # ───────────────────────────── Stage B: Finetune edges ─────────────────────────
+    # ─────────────── Stage B: Fine-tuning edges ───────────────
     if hasattr(model, "classifier"):
         for p in model.classifier.parameters(): p.requires_grad = True
     if hasattr(model, "bilin"):
@@ -155,12 +190,12 @@ def main():
         wd=1e-4
     )
 
-    # ───────────────────────────── Evaluate ─────────────────────────────
+    # ─────────────── Evaluate ───────────────
     model.eval()
     model.data = g_main.to(device)
     bootstrap_out = bootstrap_test(model, g_main, device, base_name=base_name)
     bootstrap_evaluation_best_thresh(f"{base_name}_prediction.csv", 100)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
