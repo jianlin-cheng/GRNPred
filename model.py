@@ -37,9 +37,9 @@ class GraphTransformer(nn.Module):
             tf_path=tf_path,
             priors_path=priors_path,
             tf_bind_path=tf_bind_path,
-            tf_bind2_path="/home/tmnthc/miniconda3/GRN/fimo_with_genenames_noduplicates.tsv",   
+            tf_bind2_path="/home/tmnthc/miniconda3/GRN/motif_score.tsv",   
             corr_threshold=corr_threshold,
-            anno_csv_path="/home/tmnthc/miniconda3/GRN/real_test.csv",
+            anno_csv_path="/home/tmnthc/miniconda3/GRN/text_description.csv",
             llama_model="sentence-transformers/all-MiniLM-L6-v2" ,  
         )
 
