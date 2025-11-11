@@ -17,6 +17,8 @@ wget https://github.com/tomnguyen4/GRNPred/releases/download/Data/v1.0.0/go_term
 # Text descriptions for genes
 wget https://github.com/tomnguyen4/GRNPred/releases/download/Data/v1.0.0/text_description.csv
 ```
+Google Drive (backup): https://mailmissouri-my.sharepoint.com/:f:/g/personal/tmnthc_umsystem_edu/EiYQzBD_oypCuVZyJOSY95ABSmPkhgMTEAusQwCFzrDpjQ?e=n0bedS
+
 ## How to Run
 
 Run the main script and provide the 3 required input paths.  
