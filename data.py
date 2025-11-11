@@ -59,7 +59,7 @@ def make_paths(base_name):
         f"{base_name}_ExpressionData.csv",
         f"{base_name}_refNetwork.csv",
         f"{base_name}_TFs.csv",
-        "gene_go_pairs.csv",
+        "go_term.csv",
         "tf_binding_logodds.csv"
     )
 
