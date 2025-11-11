@@ -28,9 +28,9 @@ If you run out of memory, you can adjust dimension from 128 to 64
 
 ```bash
 python main.py \
-  --expr_path mESC_Non_specific_CHIP_tf500_ExpressionData.csv \
-  --label_path mESC_Non_specific_CHIP_tf500_refNetwork.csv \
-  --tf_path mESC_Non_specific_CHIP_tf500_TFs.csv
+  --expr_path mHSC-GM_Non_specific_CHIP_tf1000_ExpressionData.csv \
+  --label_path mHSC-GM_Non_specific_CHIP_tf1000_refNetwork.csv \
+  --tf_path    mHSC-GM_Non_specific_CHIP_tf1000_TFs.csv
 ```
 
 ## Required Supporting Files
