@@ -24,7 +24,7 @@ Google Drive (backup): https://mailmissouri-my.sharepoint.com/:f:/g/personal/tmn
 Run the main script and provide the 3 required input paths.  
 The `main.py` will automatically load the data, split edges into 70/15/15 (train/val/test), train the model, and then run final evaluation on the full test split.
 
-If you run out of memory, you can adjust dimension from 128 to 64
+If you run out of memory, you can adjust dimension from 128 to 64. But please keep in mind, the result may not be as good.
 
 ```bash
 python main.py \
