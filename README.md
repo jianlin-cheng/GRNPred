@@ -22,6 +22,8 @@ wget https://github.com/tomnguyen4/GRNPred/releases/download/Data/v1.0.0/text_de
 Run the main script and provide the 3 required input paths.  
 The `main.py` will automatically load the data, split edges into 70/15/15 (train/val/test), train the model, and then run final evaluation on the full test split.
 
+If you run out of memory, you can adjust dimension from 128 to 64
+
 ```bash
 python main.py \
   --expr_path mESC_Non_specific_CHIP_tf500_ExpressionData.csv \
