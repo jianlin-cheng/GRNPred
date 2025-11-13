@@ -2,7 +2,7 @@
 AI methods for predicting gene regulatory networks from omics data.
 
 ---
-## Download Required Supporting Files
+## 📦 Download Required Supporting Files
 
 ```bash
 # GO term gene pairs
@@ -19,7 +19,9 @@ wget https://github.com/tomnguyen4/GRNPred/releases/download/Data/v1.0.0/text_de
 ```
 Google Drive (backup): https://mailmissouri-my.sharepoint.com/:f:/g/personal/tmnthc_umsystem_edu/EiYQzBD_oypCuVZyJOSY95ABSmPkhgMTEAusQwCFzrDpjQ?e=n0bedS
 
-## ⚠️ Ensuring Reproducibility
+---
+
+## ⚙️ Ensuring Reproducibility
 
 To obtain identical results, please also download the precomputed LLaMA text embedding cache and place it in your project directory:
 
@@ -33,7 +35,9 @@ To obtain identical results, please also download the precomputed LLaMA text emb
 
 Google Drive: https://mailmissouri-my.sharepoint.com/:f:/g/personal/tmnthc_umsystem_edu/EttkuWwfXvdOlv0KwyF6c1wB0E5QvugNg9aqJsReTJTIWQ?e=YZzH1s
 
-## How to Run
+---
+
+## 🚀 How to Run
 
 Run the main script and provide the 3 required input paths.  
 The `main.py` will automatically load the data, split edges into 70/15/15 (train/val/test), train the model, and then run final evaluation on the full test split.
@@ -46,8 +50,9 @@ python main.py \
   --label_path mHSC-GM_Non_specific_CHIP_tf1000_refNetwork.csv \
   --tf_path    mHSC-GM_Non_specific_CHIP_tf1000_TFs.csv
 ```
+---
 
-## Required Supporting Files
+## 📑 Required Supporting Files
 
 These must be present in the working directory (or provided via flags like `--priors_path`, `--tf_bind_path`, etc.):
 
