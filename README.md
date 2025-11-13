@@ -19,6 +19,18 @@ wget https://github.com/tomnguyen4/GRNPred/releases/download/Data/v1.0.0/text_de
 ```
 Google Drive (backup): https://mailmissouri-my.sharepoint.com/:f:/g/personal/tmnthc_umsystem_edu/EiYQzBD_oypCuVZyJOSY95ABSmPkhgMTEAusQwCFzrDpjQ?e=n0bedS
 
+## ⚠️ Ensuring Reproducibility
+
+To obtain identical results, please also download the precomputed LLaMA text embedding cache and place it in your project directory:
+
+.cache_llama_embeds/
+│
+├── all-MiniLM-L6-v2_mESC_Non_specific_CHIP_tf500_ExpressionData.csv_embeds.npy
+├── all-MiniLM-L6-v2_mHSC-GM_Celltype_CHIP_tf1000_ExpressionData.csv_embeds.npy
+├── ...
+
+Google Drive: https://mailmissouri-my.sharepoint.com/:f:/g/personal/tmnthc_umsystem_edu/EttkuWwfXvdOlv0KwyF6c1wB0E5QvugNg9aqJsReTJTIWQ?e=YZzH1s
+
 ## How to Run
 
 Run the main script and provide the 3 required input paths.  
