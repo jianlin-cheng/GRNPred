@@ -5,8 +5,8 @@ AI methods for predicting gene regulatory networks from omics data.
 ## 📦 Download Required Supporting Files
 
 ```bash
-# GO term gene pairs
-wget https://github.com/tomnguyen4/GRNPred/releases/download/Data/v1.0.0/gene_go_pairs.csv
+# Motif score
+wget https://github.com/tomnguyen4/GRNPred/releases/download/Data/v1.0.0/motif_score.tsv
 
 # TF motif binding log-odds
 wget https://github.com/tomnguyen4/GRNPred/releases/download/Data/v1.0.0/tf_binding_logodds.csv
