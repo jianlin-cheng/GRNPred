@@ -16,6 +16,9 @@ wget https://github.com/tomnguyen4/GRNPred/releases/download/Data/v1.0.0/go_term
 
 # Text descriptions for genes
 wget https://github.com/tomnguyen4/GRNPred/releases/download/Data/v1.0.0/text_description.csv
+
+# Human transcription factor
+wget https://github.com/tomnguyen4/GRNPred/releases/download/Data/v1.0.0/human-tfs.csv
 ```
 Google Drive (backup): https://mailmissouri-my.sharepoint.com/:f:/g/personal/tmnthc_umsystem_edu/EiYQzBD_oypCuVZyJOSY95ABSmPkhgMTEAusQwCFzrDpjQ?e=7ztFia
 
