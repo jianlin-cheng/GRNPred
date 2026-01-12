@@ -1,5 +1,9 @@
 # GRNPred
-AI methods for predicting gene regulatory networks from omics data.
+
+![Demo image](images/model_architecture.jpg)
+
+GRNPred is a multimodal graph transformer framework for robust GRN inference that integrates gene expression, functional annotations, semantic gene descriptions, regulatory sequence priors, and network topology.
+GRNPred follows a two-stage training strategy. In a self-supervised pretraining phase, a graph transformer encoder is trained on TF-centered subgraphs using masked gene-expression reconstruction, enabling the model to learn transcriptional context from unlabeled data. The pretrained encoder is then finetuned for supervised TF–target edge prediction using available regulatory annotations. Transformer-based attention allows GRNPred to capture long-range and context-dependent regulatory interactions that are difficult to model with conventional graph neural networks. 
 
 ---
 ## 📦 Download Required Supporting Files
