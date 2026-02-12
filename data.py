@@ -63,6 +63,7 @@ def make_paths(base_name):
         "tf_binding_logodds.csv"
     )
 
+
 def load_data(
     expr_path:      str,
     label_path:     str,
@@ -252,16 +253,34 @@ def load_data(
         bind2_dict = {(int(r.s), int(r.d)): float(r.best_score) for r in b2.itertuples(index=False)}
 
     
+  
+    # ---------------------------------------------------------
+    # Build graph edges STRICTLY by correlation threshold
+    # Drop ALL edges with corr < corr_threshold (no exceptions)
+    # ---------------------------------------------------------
     iu, ju = np.triu_indices(N, k=1)
     mask = corr_mat[iu, ju] >= corr_threshold
+
     src = np.concatenate([iu[mask], ju[mask]])
     dst = np.concatenate([ju[mask], iu[mask]])
-    corr_vals = np.concatenate([corr_mat[iu[mask], ju[mask]]] * 2)
-    bind_vals = np.array([bind_dict.get((s, d), 0.0) for s, d in zip(src, dst)], dtype=np.float32)
-    if bind2_dict is not None:
-        bind2_vals = np.array([bind2_dict.get((s, d), 0.0) for s, d in zip(src, dst)], dtype=np.float32)
+    corr_vals = np.concatenate([corr_mat[iu[mask], ju[mask]]] * 2).astype(np.float32, copy=False)
 
+    bind_vals = np.array(
+        [bind_dict.get((s, d), 0.0) for s, d in zip(src, dst)],
+        dtype=np.float32
+    )
+
+    if bind2_dict is not None:
+        bind2_vals = np.array(
+            [bind2_dict.get((s, d), 0.0) for s, d in zip(src, dst)],
+            dtype=np.float32
+        )
+
+    # ---------------------------------------------------------
+    # Positives are defined ONLY on the kept edges (corr >= threshold)
+    # ---------------------------------------------------------
     labels_df = pd.read_csv(label_path)
+
     pos_set = {
         (gene_to_idx[r.Gene1], gene_to_idx[r.Gene2])
         for r in labels_df.itertuples()
@@ -270,29 +289,24 @@ def load_data(
         and (gene_to_idx[r.Gene1] in tf_set)
     }
 
-    existing = set(zip(src, dst))
-    missing = pos_set - existing
-    if missing:
-        add_src, add_dst, add_corr, add_bind = [], [], [], []
-        if bind2_dict is not None:
-            add_bind2 = []
-        for s2, d2 in missing:
-            for a, b in ((s2, d2), (d2, s2)):
-                add_src.append(a); add_dst.append(b)
-                add_corr.append(corr_mat[a, b])
-                add_bind.append(bind_dict.get((a, b), 0.0))
-                if bind2_dict is not None:
-                    add_bind2.append(bind2_dict.get((a, b), 0.0))
-        if add_src:
-            src       = np.concatenate([src, np.array(add_src, dtype=np.int64)])
-            dst       = np.concatenate([dst, np.array(add_dst, dtype=np.int64)])
-            corr_vals = np.concatenate([corr_vals, np.array(add_corr, dtype=np.float32)])
-            bind_vals = np.concatenate([bind_vals, np.array(add_bind, dtype=np.float32)])
-            if bind2_dict is not None:
-                bind2_vals = np.concatenate([bind2_vals, np.array(add_bind2, dtype=np.float32)])
+    # Build y on current edge list only (no adding missing positives)
+    E0 = len(src)
+    y_np = np.fromiter(
+        ((s, d) in pos_set for s, d in zip(src, dst)),
+        dtype=np.float32,
+        count=E0
+    )
+
+    # Sanity check (should be zero)
+    n_bad = int((corr_vals < corr_threshold).sum())
+    if n_bad != 0:
+        raise RuntimeError(f"Found {n_bad} edges with corr < corr_threshold after filtering (bug).")
+
+ 
 
     E0 = len(src)
-    y_np = np.fromiter(((s, d) in pos_set for s, d in zip(src, dst)), dtype=np.float32, count=E0)
+    y_np = np.fromiter(((s, d) in pos_set for s, d in zip(src, dst)),
+                    dtype=np.float32, count=E0)
 
     tf_to_edges = defaultdict(list)
     for e, (s, d) in enumerate(zip(src, dst)):
@@ -344,8 +358,13 @@ def load_data(
 
     keep_mask = np.zeros(E0, dtype=bool)
     owned_split = np.empty(E0, dtype=object)
+
+    # -------------------------
+    # Assign each edge to a split (same logic as your code)
+    # -------------------------
     for e, (s, d) in enumerate(zip(src, dst)):
         if (s in tf_set) and (d in tf_set):
+            # TF-TF edge must belong to same TF split, otherwise drop
             if tf_to_split.get(s) != tf_to_split.get(d):
                 owned_split[e] = None
                 continue
@@ -356,19 +375,41 @@ def load_data(
             assigned = tf_to_split[d]
         else:
             assigned = gg_split.get(e, "train")
+
         owned_split[e] = assigned
         keep_mask[e] = True
 
-    src       = src[keep_mask]
-    dst       = dst[keep_mask]
-    corr_vals = corr_vals[keep_mask]
-    bind_vals = bind_vals[keep_mask]
-    y_np      = y_np[keep_mask]
+    # ---------------------------------------------------------
+    # Enforce: NO low-correlation positives in TEST
+    # ---------------------------------------------------------
+    # NOTE: y_np is already built on E0 edges (including any added missing positives)
+    lowcorr_pos = (y_np == 1) & (corr_vals < corr_threshold)
+    is_test     = (owned_split == "test")
+    drop_test_lowcorr_pos = lowcorr_pos & is_test
+
+    if drop_test_lowcorr_pos.any():
+        print(f"[SPLIT-FIX] Dropping {int(drop_test_lowcorr_pos.sum())} "
+              f"test positives with corr < {corr_threshold}.")
+        keep_mask[drop_test_lowcorr_pos] = False
+        owned_split[drop_test_lowcorr_pos] = None  # optional, for clarity/debugging
+
+    # -------------------------
+    # Apply keep_mask
+    # -------------------------
+    src         = src[keep_mask]
+    dst         = dst[keep_mask]
+    corr_vals   = corr_vals[keep_mask]
+    bind_vals   = bind_vals[keep_mask]
+    y_np        = y_np[keep_mask]
     owned_split = owned_split[keep_mask]
     if bind2_dict is not None:
         bind2_vals = bind2_vals[keep_mask]
+
     E = len(src)
 
+    # -------------------------
+    # Split masks (torch + bool)
+    # -------------------------
     train_mask = torch.tensor([s == "train" for s in owned_split], dtype=torch.bool)
     val_mask   = torch.tensor([s == "val"   for s in owned_split], dtype=torch.bool)
     test_mask  = torch.tensor([s == "test"  for s in owned_split], dtype=torch.bool)
@@ -376,6 +417,13 @@ def load_data(
     train_mask_bool = (owned_split == "train")
     val_mask_bool   = (owned_split == "val")
     test_mask_bool  = (owned_split == "test")
+
+    # -------------------------
+    # Sanity check: must be zero
+    # -------------------------
+    bad_test = int(((y_np == 1) & (corr_vals < corr_threshold) & test_mask_bool).sum())
+    print("[CHECK] low-corr positives in TEST:", bad_test)
+
 
     edge_cols = [corr_vals.astype(np.float32, copy=False),
                 bind_vals.astype(np.float32, copy=False)]
@@ -477,4 +525,3 @@ def load_data(
     data.tf_indices   = tf_indices
     data.expr_dim     = expr_np.shape[1]
     return data
-
