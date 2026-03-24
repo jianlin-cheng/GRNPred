@@ -55,7 +55,7 @@ If you run out of memory, you can adjust dimension from 128 to 64. But please ke
 python main.py \
   --expr_path mHSC-GM_Non_specific_CHIP_tf1000_ExpressionData.csv \
   --label_path mHSC-GM_Non_specific_CHIP_tf1000_refNetwork.csv \
-  --tf_path    mHSC-GM_Non_specific_CHIP_tf1000_TFs.csv
+  --tf_path    human-tfs.csv
 ```
 ---
 
