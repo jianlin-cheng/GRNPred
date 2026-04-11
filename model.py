@@ -37,10 +37,11 @@ class GraphTransformer(nn.Module):
             tf_path=tf_path,
             priors_path=priors_path,
             tf_bind_path=tf_bind_path,
-            tf_bind2_path="/home/tmnthc/miniconda3/GRN/motif_score.tsv",   
+            tf_bind2_path="/home/tmnthc/miniconda3/GRN2/GRN/motif_score.tsv",   
             corr_threshold=corr_threshold,
-            anno_csv_path="/home/tmnthc/miniconda3/GRN/text_description.csv",
+            anno_csv_path="/home/tmnthc/miniconda3/GRN2/GRN/text_description.csv",
             llama_model="sentence-transformers/all-MiniLM-L6-v2" ,  
+            test_pair_path = test_pair_path
         )
 
         # ── 2) Positional / structural embedding ───────────────────────────────
