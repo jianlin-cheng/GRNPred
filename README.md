@@ -97,6 +97,10 @@ python3 inference.py \
    --test_pair_path  /home/tmnthc/miniconda3/GRN2/GRN/GRNPred-main_2/Test_pair.csv
 
 ```
+📤 Output
+
+- A CSV file containing predictions for each input pair:
+  -(Gene1, Gene2, prediction score)
 
 ---
 
