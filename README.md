@@ -77,7 +77,7 @@ If you want to run inference **without training**, you can use a pretrained mode
 
 ### 📥 Required Inputs
 
-- Pretrained model checkpoint (`.pt`)
+- Pretrained model checkpoint (`pretrained_weight.pt`)
 - Expression file (`--expr_path`)
 - TF list (`--tf_path`)
 - Test pairs file (`--test_pair_path`)  
