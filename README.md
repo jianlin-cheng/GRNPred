@@ -51,6 +51,7 @@ The `main.py` will automatically load the data, split edges into 70/15/15 (train
 
 If you run out of memory, you can adjust dimension from 128 to 64. But please keep in mind, the result may not be as good.
 
+For example: 
 ```bash
 python main.py \
   --expr_path mHSC-GM_Non_specific_CHIP_tf1000_ExpressionData.csv \
@@ -68,4 +69,45 @@ These must be present in the working directory (or provided via flags like `--pr
 - `go_term.csv`
 - `text_description.csv`
 
+---
 
+## 🔍 To Run Inference from Pretrained Weight
+
+If you want to run inference **without training**, you can use a pretrained model checkpoint (`.pt`) together with a custom list of gene pairs.
+
+### 📥 Required Inputs
+
+- Pretrained model checkpoint (`.pt`)
+- Expression file (`--expr_path`)
+- TF list (`--tf_path`)
+- Test pairs file (`--test_pair_path`)  
+- Supporting files (same as training):
+  - `gene_go_pairs.csv`
+  - `tf_binding_logodds.csv`
+  - `go_term.csv`
+  - `text_description.csv`
+
+---
+
+### 🧪 Format of Test Pair File
+
+The test pair CSV must contain:
+
+```csv
+Gene1,Gene2
+GeneA,GeneB
+GeneC,GeneD
+...
+```
+---
+
+### ▶️ Run Inference
+
+For example: 
+```bash
+python3 inference.py \
+  --expr_path /home/tmnthc/miniconda3/GRN2/GRN/mHSC-GM_Non_specific_CHIP_tf500_ExpressionData.csv \
+   --tf_path    /home/tmnthc/miniconda3/GRN2/GRN/human-tfs.csv
+   --test_pair_path  /home/tmnthc/miniconda3/GRN2/GRN/GRNPred-main_2/Test_pair.csv
+
+```
