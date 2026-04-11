@@ -87,6 +87,17 @@ If you want to run inference **without training**, you can use a pretrained mode
   - `go_term.csv`
   - `text_description.csv`
 
+▶️ Run Inference
+
+For example: 
+```bash
+python3 inference.py \
+  --expr_path /home/tmnthc/miniconda3/GRN2/GRN/mHSC-GM_Non_specific_CHIP_tf500_ExpressionData.csv \
+   --tf_path    /home/tmnthc/miniconda3/GRN2/GRN/human-tfs.csv
+   --test_pair_path  /home/tmnthc/miniconda3/GRN2/GRN/GRNPred-main_2/Test_pair.csv
+
+```
+
 ---
 
 ### 🧪 Format of Test Pair File
@@ -99,15 +110,4 @@ GeneA,GeneB
 GeneC,GeneD
 ...
 ```
----
 
-### ▶️ Run Inference
-
-For example: 
-```bash
-python3 inference.py \
-  --expr_path /home/tmnthc/miniconda3/GRN2/GRN/mHSC-GM_Non_specific_CHIP_tf500_ExpressionData.csv \
-   --tf_path    /home/tmnthc/miniconda3/GRN2/GRN/human-tfs.csv
-   --test_pair_path  /home/tmnthc/miniconda3/GRN2/GRN/GRNPred-main_2/Test_pair.csv
-
-```
