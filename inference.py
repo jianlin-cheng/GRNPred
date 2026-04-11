@@ -134,7 +134,7 @@ def main():
     print(f"Using device: {device}\n")
 
 
-    save_path = f"mESC_Non_specific_CHIP_tf500_final_model.pt"
+    save_path = f"pretrained_weight.pt"
 
     # Build model (GraphTransformer loads data internally)
     model = GraphTransformer(
