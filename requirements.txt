@@ -1,0 +1,23 @@
+# GRNPred — Python dependency specification
+# Verified on: Python 3.10+, CUDA 12.4, torch 2.6.0+cu124
+#
+# Install:
+#   1. pip install torch==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+#   2. pip install torch-geometric
+#   3. pip install -r requirements.txt
+#
+# For multi-seed runs: python main.py ... --seed <N>
+
+torch==2.6.0
+transformers>=4.40.0
+huggingface-hub>=0.22.0
+sentence-transformers>=3.0.0
+scikit-learn>=1.4.0
+numpy>=1.26.0
+scipy>=1.12.0
+torchmetrics>=1.3.0
+pandas>=2.1.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+shap>=0.45.0
+tqdm>=4.66.0

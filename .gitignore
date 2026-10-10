@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Local caches and checkpoints
+.cache_llama_embeds/
+*.pt
+!Data/sample_mHSC-GM_Non_specific_CHIP_tf1000/pretrained_weight.pt
+
+# Large local data / experiment trees (keep tracked sample Results/ CSVs)
+inputs/
+priors/
+resources/
+fair_eval_data/
+Data/go_term.csv
+Data/motif_score.tsv
+Data/text_description.csv
+Data/yeast_grnformer/
+
+Results/*
+!Results/mHSC-GM_Non_specific_CHIP_tf1000_prediction.csv
+!Results/mHSC-GM_Non_specific_CHIP_tf1000_prediction_metrics.csv
+!Results/mHSC-GM_Non_specific_CHIP_tf500_prediction.csv
+!Results/mHSC-GM_Non_specific_CHIP_tf500_prediction_metrics.csv
+
+# Root-level generated / local artifacts
+gene_go_pairs.csv
+go_term.csv
+text_description.csv
+human-tfs.csv
+mHSC-GM_ns_tf1000_grcm39_prediction.csv
+mHSC-GM_ns_tf1000_grcm39_prediction_metrics.csv
+mHSC-GM_ns_tf1000_grcm39_prediction_metrics_imbalanced.csv
+mHSC-GM_ns_tf1000_grcm39_pretrained_weight.pt
+
+# Revision working copy (not part of this code push)
+revision/
+
+# Local notes and review materials
+REVIEWER_TRACKER.md
+REVISION_SUMMARY.md
+*.pptx
+*.docx
+GRNPred_paper_final.pdf
+
+# Local-only scripts (ablations, plots, revision packaging, biology, baselines)
+scripts/*
+!scripts/build_gene_annotations.py
+!scripts/rebuild_sequence_priors.py
+!scripts/rebuild_all_priors.sh
+!scripts/build_yeast_motif_priors.py
+!scripts/fetch_yeast_genome_reference.py
+!scripts/run_main42_fullcoexp.py
+
+# Logs and editor
+*.log
+.DS_Store
+.idea/
+.vscode/

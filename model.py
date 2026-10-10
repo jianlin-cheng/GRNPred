@@ -1,63 +1,132 @@
 import torch
 from torch import nn
-from torch_geometric.nn import TransformerConv, GCNConv
+from torch_geometric.nn import TransformerConv, GCNConv, GATConv
 from data import *
 import torch.nn.functional as F
 
+# Positional embedding is indexed by hop distance from the subgraph's center TF,
+# so its size is independent of the number of genes and it transfers to unseen TFs.
+POS_HOP_BUCKETS = 16
+
+
 def ensure_pos_emb_capacity(model, need):
-   cur = model.pos_emb.num_embeddings
-   if need <= cur:
-       return
-   new_emb = nn.Embedding(need, model.pos_emb.embedding_dim).to(model.pos_emb.weight.device)
-   with torch.no_grad():
-       new_emb.weight[:cur] = model.pos_emb.weight
-       nn.init.normal_(new_emb.weight[cur:], std=0.02)
-   model.pos_emb = new_emb
+   """No-op: pos_emb is hop-indexed, so it does not scale with the gene count."""
+   return
 
 class GraphTransformer(nn.Module):
     def __init__(
         self,
-        expr_path: str, label_path: str, tf_path: str, priors_path: str,
-        tf_bind_path: str, corr_threshold: float = 0.1,
-        hidden_dim: int = 128, heads: int = 7, num_layers: int = 7,
-        dropout: float = 0.2, lr: float = 5e-4, seed: int = 42
+        expr_path: str,
+        label_path: str,
+        tf_path: str,
+        priors_path: str,
+        tf_bind_path: str,
+        corr_threshold: float = 0.1,
+        # CHANGED [A11-defaults]: match Table 1 (heads=8, num_layers=1, dropout=0.1).
+        # ORIGINAL: heads: int = 7, num_layers: int = 7, dropout: float = 0.2
+        hidden_dim: int = 128,
+        heads: int = 8,
+        num_layers: int = 1,
+        dropout: float = 0.1,
+        lr: float = 5e-4,
+        seed: int = 42,
+        # CHANGED [A10-test-pair]: was used at line 44 but missing from signature → NameError.
+        # ORIGINAL: (parameter missing)
+        test_pair_path: str | None = None,
+        # CHANGED [A11-hardcoded]: replace /home/tmnthc/ paths with None defaults.
+        # ORIGINAL: hardcoded paths in load_data call
+        tf_bind2_path: str | None = None,
+        anno_csv_path: str | None = None,
+        llama_model: str | None = None,
+        llama_batch_size: int = 16,
+        llama_max_tokens: int = 256,
+        use_tf_indicator: bool = True,
+        # CHANGED [decoder-ablation]: choose edge decoder used in task="edge"
+        # ORIGINAL: (always MLP + bilinear + cosine)
+        edge_decoder: str = "mlp",  # "mlp" | "ip_mean_edgeattr"
+        # CHANGED [arch-ablation]: node conv used in the encoder
+        # ORIGINAL: always TransformerConv
+        conv_type: str = "transformer",  # "transformer" | "gcn" | "gat"
+        freeze_split_path: str | None = None,
+        input_noise_std: float = 0.1,
+        ablate_go: bool = False,
+        ablate_text: bool = False,
+        ablate_tf_bind: bool = False,
+        ablate_motif: bool = False,
     ):
         super().__init__()
         self.seed = int(seed)
-        self.rng = torch.Generator(device="cuda").manual_seed(self.seed)
+        # CHANGED [A10-cuda-rng]: was device="cuda" always → crash on CPU.
+        # ORIGINAL: self.rng = torch.Generator(device="cuda").manual_seed(self.seed)
+        _rng_device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.rng = torch.Generator(device=_rng_device).manual_seed(self.seed)
         self.bilin = nn.Bilinear(hidden_dim, hidden_dim, 1, bias=True)
         self.cls_mix = nn.Parameter(torch.tensor(0.5))
         self.edge_gate = nn.Parameter(torch.tensor(0.3))  # start conservative
         self.cos_mix = nn.Parameter(torch.tensor(0.2))
+        # CHANGED [decoder-ablation]
+        self.edge_decoder = str(edge_decoder)
+        self.conv_type = str(conv_type).lower()
+        if self.conv_type not in {"transformer", "gcn", "gat"}:
+            raise ValueError(f"conv_type must be transformer|gcn|gat, got {conv_type!r}")
+        self.input_noise_std = float(input_noise_std)
+        if self.input_noise_std < 0:
+            raise ValueError(f"input_noise_std must be >= 0, got {input_noise_std}")
+        # Learnable scale/bias for IP + mean(edge_attr_ij) decoder
+        self.ip_edge_alpha = nn.Parameter(torch.tensor(1.0))
+        self.ip_edge_bias = nn.Parameter(torch.tensor(0.0))
 
         # ── 1) Load data ────────────────────────────────────────────────────────
+        freeze_split = None
+        if freeze_split_path:
+            import json
+            with open(freeze_split_path, encoding="utf-8") as f:
+                freeze_split = json.load(f)
+            print(f"[INFO] Loaded freeze split from {freeze_split_path} "
+                  f"(ref corr={freeze_split.get('ref_corr_threshold')}, "
+                  f"pairs={len(freeze_split.get('pair_to_split', {}))})")
+
         self.data = load_data(
             expr_path=expr_path,
             label_path=label_path,
             tf_path=tf_path,
             priors_path=priors_path,
             tf_bind_path=tf_bind_path,
-            tf_bind2_path="/home/tmnthc/miniconda3/GRN2/GRN/motif_score.tsv",   
+            # CHANGED [A11-hardcoded]
+            tf_bind2_path=tf_bind2_path,
             corr_threshold=corr_threshold,
-            anno_csv_path="/home/tmnthc/miniconda3/GRN2/GRN/text_description.csv",
-            llama_model="sentence-transformers/all-MiniLM-L6-v2" ,  
-            test_pair_path = test_pair_path
+            # CHANGED [A11-hardcoded]
+            anno_csv_path=anno_csv_path,
+            # CHANGED [A5]: MiniLM default via load_data when llama_model is None
+            llama_model=llama_model,
+            llama_batch_size=llama_batch_size,
+            llama_max_tokens=llama_max_tokens,
+            # CHANGED [A10-test-pair]
+            test_pair_path=test_pair_path,
+            seed=seed,
+            use_tf_indicator=use_tf_indicator,
+            freeze_split=freeze_split,
+            ablate_go=ablate_go,
+            ablate_text=ablate_text,
+            ablate_tf_bind=ablate_tf_bind,
+            ablate_motif=ablate_motif,
         )
 
         # ── 2) Positional / structural embedding ───────────────────────────────
         num_nodes     = self.data.x.size(0)
         orig_feat_dim = self.data.x.size(1)
-        self.pos_emb  = nn.Embedding(num_nodes, hidden_dim)
+        self.pos_emb  = nn.Embedding(POS_HOP_BUCKETS, hidden_dim)
 
         # ── 3) Input & edge dims ───────────────────────────────────────────────
         in_dim   = orig_feat_dim + hidden_dim
         edge_dim = self.data.edge_attr.size(1)
 
-        # ── 4) Edge loss (classifier) criterion ────────────────────────────────
-        y = self.data.y  # [E]
-        n_pos = (y == 1).sum().item()
-        n_neg = (y == 0).sum().item()
-        alpha = n_neg / (n_pos + n_neg + 1e-8) if n_pos > 0 else 0.5
+        # CHANGED [A11-alpha]: removed unused alpha (imbalance handled by 50:1 subsampling).
+        # ORIGINAL:
+        #   y = self.data.y
+        #   n_pos = (y == 1).sum().item()
+        #   n_neg = (y == 0).sum().item()
+        #   alpha = n_neg / (n_pos + n_neg + 1e-8) if n_pos > 0 else 0.5
 
         # ── 5) Node feature projection ────────────────────────────────────────
         self.node_lin = nn.Sequential(
@@ -67,16 +136,26 @@ class GraphTransformer(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # ── 6) TransformerConv stack ──────────────────────────────────────────
+        # ── 6) Message-passing stack ──────────────────────────────────────────
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
         for _ in range(num_layers):
-            self.convs.append(
-                TransformerConv(
-                    hidden_dim, hidden_dim, heads=heads, concat=False,
-                    edge_dim=edge_dim, dropout=dropout
+            if self.conv_type == "gcn":
+                self.convs.append(GCNConv(hidden_dim, hidden_dim))
+            elif self.conv_type == "gat":
+                self.convs.append(
+                    GATConv(
+                        hidden_dim, hidden_dim, heads=heads, concat=False,
+                        dropout=dropout, edge_dim=edge_dim,
+                    )
                 )
-            )
+            else:
+                self.convs.append(
+                    TransformerConv(
+                        hidden_dim, hidden_dim, heads=heads, concat=False,
+                        edge_dim=edge_dim, dropout=dropout
+                    )
+                )
             self.norms.append(nn.LayerNorm(hidden_dim))
 
         # ── 7) Edge attribute updater ─────────────────────────────────────────
@@ -116,27 +195,85 @@ class GraphTransformer(nn.Module):
         self.lr = lr
 
  
+    def _pos_ids(self, x):
+        """Hop distance from the subgraph's center TF (0 = the TF itself).
+
+        Structural, so held-out TFs are encoded the same way as training TFs.
+        Falls back to hop 0 for graphs built without hop_dist.
+        """
+        hop = getattr(self.data, "hop_dist", None)
+        if hop is None:
+            return torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+        hop = hop.to(device=x.device, dtype=torch.long)
+        if hop.numel() != x.size(0):
+            raise RuntimeError(
+                f"pos_emb hop_dist length {hop.numel()} != x.size(0) {x.size(0)}; "
+                "subgraph Data must set hop_dist per node"
+            )
+        return hop.clamp(0, self.pos_emb.num_embeddings - 1)
+
     def _encode(self, x, edge_index, edge_attr, training: bool):
         device = x.device
-        idx = torch.arange(x.size(0), device=device)
+        idx = self._pos_ids(x)
         p   = self.pos_emb(idx)
-        x   = torch.cat([x, p], dim=1)          
-        h   = self.node_lin(x)               
+        x   = torch.cat([x, p], dim=1)
+        h   = self.node_lin(x)
 
         e = edge_attr
+        if edge_index.size(1) == 0:
+            for norm in self.norms:
+                h_in = h
+                h = F.relu(norm(h_in))
+            return h, e
+
         for conv, norm in zip(self.convs, self.norms):
             e_drop = F.dropout(e, p=self.dropout, training=training)
             h_in = h
-            h = conv(h, edge_index, e_drop)
+            if self.conv_type == "gcn":
+                h = conv(h, edge_index)
+            else:
+                h = conv(h, edge_index, e_drop)
             h = norm(h + h_in)
             h = F.relu(h)
 
             row, col = edge_index
             h_i, h_j = h[row], h[col]
             e_new = self.edge_updater(torch.cat([h_i, h_j, e_drop], dim=-1))
-            e     = e_drop + torch.sigmoid(self.edge_gate) * e_new   
+            e     = e_drop + torch.sigmoid(self.edge_gate) * e_new
 
         return h, e
+
+    def decode_edges(self, h, src, dst, edge_attr=None):
+        hi, hj = h[src], h[dst]
+        if getattr(self, "edge_decoder", "mlp") == "ip_mean_edgeattr":
+            ip = (hi * hj).sum(dim=-1)
+            e_mean = edge_attr.mean(dim=-1) if edge_attr is not None else 0.0
+            return ip + self.ip_edge_alpha * e_mean + self.ip_edge_bias
+
+        had   = hi * hj
+        diff1 = (hi - hj).abs()
+        edge_repr = torch.cat([hi, hj, had, diff1], dim=-1)
+        mlp_score = self.classifier(edge_repr).squeeze(-1)
+
+        bil_score = None
+        if hasattr(self, "bilin") and self.bilin is not None:
+            bil_score = self.bilin(hi, hj).squeeze(-1)
+
+        if bil_score is not None and hasattr(self, "cls_mix") and self.cls_mix is not None:
+            mix = torch.sigmoid(self.cls_mix)
+            edge_logits = mix * mlp_score + (1.0 - mix) * bil_score
+        else:
+            edge_logits = mlp_score
+
+        cos = F.cosine_similarity(hi, hj, dim=-1)
+        if hasattr(self, "cos_scale"):
+            bias = getattr(self, "cos_bias", torch.tensor(0.0, device=h.device))
+            edge_logits = edge_logits + self.cos_scale * (cos + bias)
+        else:
+            edge_logits = edge_logits + torch.tanh(self.cos_mix) * cos
+        if hasattr(self, "logit_bias"):
+            edge_logits = edge_logits + self.logit_bias
+        return edge_logits
 
     def reinit_edge_head(self):
         import math, torch.nn as nn
@@ -183,16 +320,21 @@ class GraphTransformer(nn.Module):
         for m in self.norms:                   [setattr(p, 'requires_grad', (not frozen)) for p in m.parameters()]
         for p in self.edge_updater.parameters(): p.requires_grad = (not frozen)
 
-    def forward(self, mask_ratio: float = 0.0, task: str = "edge", split: str | None = None):
-       
+    def forward(
+        self,
+        mask_ratio: float = 0.0,
+        task: str = "edge",
+        split: str | None = None,
+        score_edge_index=None,
+        score_edge_attr=None,
+    ):
         device = next(self.parameters()).device
         x  = self.data.x.to(device)
         ei = self.data.edge_index.to(device)
         ea = self.data.edge_attr.to(device)
 
-        if self.training:
-
-            x = x + torch.randn_like(x) * 0.1
+        if self.training and self.input_noise_std > 0:
+            x = x + torch.randn_like(x) * self.input_noise_std
 
         def _nodes_touched_by(mask_e: torch.Tensor | None) -> torch.Tensor:
          
@@ -316,33 +458,10 @@ class GraphTransformer(nn.Module):
             return mask_local & touched
 
         if task == "edge":
-
             h_e, _ = self._encode(x, ei, ea, self.training)
-            row, col = ei
-            hi, hj = h_e[row], h_e[col]
-            had   = hi * hj
-            diff1 = (hi - hj).abs()
-            edge_repr = torch.cat([hi, hj, had, diff1], dim=-1) 
-
-
-            mlp_score = self.classifier(edge_repr).squeeze(-1)
-
-            bil_score = None
-            if hasattr(self, "bilin") and self.bilin is not None:
-                bil_score = self.bilin(hi, hj).squeeze(-1)
-
-            if bil_score is not None and hasattr(self, "cls_mix") and self.cls_mix is not None:
-                mix = torch.sigmoid(self.cls_mix)
-                
-                edge_logits = mix * mlp_score + (1.0 - mix) * bil_score
-                cos = F.cosine_similarity(hi, hj, dim=-1)                 
-                edge_logits = edge_logits + torch.tanh(self.cos_mix) * cos
-
-            else:
-                edge_logits = mlp_score
-                cos = F.cosine_similarity(hi, hj, dim=-1)                 
-                edge_logits = edge_logits + torch.tanh(self.cos_mix) * cos
-            return edge_logits
+            score_ei = ei if score_edge_index is None else score_edge_index.to(device)
+            score_ea = ea if score_edge_attr is None else score_edge_attr.to(device)
+            return self.decode_edges(h_e, score_ei[0], score_ei[1], score_ea)
 
         if task == "gene_expression":
             N = x.size(0)
@@ -359,28 +478,10 @@ class GraphTransformer(nn.Module):
             return expr_pred, mask_nodes
 
         if task == "both":
-
             h_e, _ = self._encode(x, ei, ea, self.training)
-            row, col = ei
-            hi, hj = h_e[row], h_e[col]
-            edge_repr = torch.cat([hi, hj], dim=-1)
-
-            mlp_score = self.classifier(edge_repr).squeeze(-1)
-
-            bil_score = None
-            if hasattr(self, "bilin") and self.bilin is not None:
-                bil_score = self.bilin(hi, hj).squeeze(-1)
-
-            if bil_score is not None and hasattr(self, "cls_mix") and self.cls_mix is not None:
-                mix = torch.sigmoid(self.cls_mix)
-                edge_logits = mix * mlp_score + (1.0 - mix) * bil_score
-                cos = F.cosine_similarity(hi, hj, dim=-1)                
-                edge_logits = edge_logits + torch.tanh(self.cos_mix) * cos
-
-            else:
-                edge_logits = mlp_score
-                cos = F.cosine_similarity(hi, hj, dim=-1)                
-                edge_logits = edge_logits + torch.tanh(self.cos_mix) * cos
+            score_ei = ei if score_edge_index is None else score_edge_index.to(device)
+            score_ea = ea if score_edge_attr is None else score_edge_attr.to(device)
+            edge_logits = self.decode_edges(h_e, score_ei[0], score_ei[1], score_ea)
 
 
             N = x.size(0)

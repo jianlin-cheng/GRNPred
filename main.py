@@ -8,7 +8,6 @@ import random
 import argparse
 import numpy as np
 import torch
-from torch_geometric.utils import k_hop_subgraph
 import re
 
 def seed_everything(seed: int = 42):
@@ -48,10 +47,8 @@ def seed_everything(seed: int = 42):
     except Exception:
         pass
 
-# --- in main() ---
-seed_everything(42)
-
-seed = 42
+# CHANGED [A-seed]: removed module-level seed_everything(42) / seed=42.
+# ORIGINAL: seed_everything(42); seed = 42
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -67,10 +64,49 @@ def parse_args():
                    help="Path to gene_go_pairs.csv (default: gene_go_pairs.csv)")
     p.add_argument("--tf_bind_path",  default="tf_binding_logodds.csv",
                    help="Path to tf_binding_logodds.csv (default: tf_binding_logodds.csv)")
+    # CHANGED [species-cli]: expose bind2 / text / TF-indicator (model.py already accepts these)
+    # ORIGINAL: no --tf_bind2_path / --anno_csv_path / --no_tf_indicator
+    p.add_argument("--tf_bind2_path", default=None,
+                   help="Optional second motif score table (motif_score.tsv / FIMO TSV)")
+    p.add_argument("--anno_csv_path", default=None,
+                   help="Optional gene text descriptions CSV (text_description.csv)")
+    p.add_argument("--no_tf_indicator", action="store_true",
+                   help="Ablate TF-identity node feature shortcut (use_tf_indicator=False)")
+    p.add_argument("--ablate_go", action="store_true",
+                   help="Zero GO multi-hot node features")
+    p.add_argument("--ablate_text", action="store_true",
+                   help="Zero MiniLM text embedding node features")
+    p.add_argument("--ablate_tf_bind", action="store_true",
+                   help="Zero TF-binding-probability edge features")
+    p.add_argument("--ablate_motif", action="store_true",
+                   help="Zero motif-score edge features")
+    p.add_argument("--expr_only", action="store_true",
+                   help="Keep expression (+degree/TF-id); zero GO, text, TF-bind, motif")
     p.add_argument("--corr_threshold", type=float, default=0.1)
     p.add_argument("--max_epochs",     type=int,   default=1000)
     p.add_argument("--patience",       type=int,   default=5)
-    p.add_argument("--hops_tf",        type=int,   default=2)
+    p.add_argument("--hops_tf",        type=int,   default=2,
+                   help="Max hops when hop-filling a TF-centered subgraph to --max_nodes_tf")
+    p.add_argument("--max_nodes_tf",   type=int,   default=100,
+                   help="Hop-fill each split-isolated TF subgraph until this many nodes; "
+                        "an overflowing hop is packed without replacement into extra subgraphs")
+    p.add_argument("--mask_ratio",     type=float, default=0.1,
+                   help="Stage A expression mask ratio (train and val)")
+    p.add_argument("--w_mse", type=float, default=1.0, help="Stage A MSE loss weight")
+    p.add_argument("--w_pcc", type=float, default=1.0, help="Stage A Pearson loss weight")
+    p.add_argument("--w_mae", type=float, default=1.0, help="Stage A MAE loss weight")
+    p.add_argument("--w_bce", type=float, default=1.0,
+                   help="Stage B weight on binary cross-entropy (logits)")
+    p.add_argument("--w_ap", type=float, default=0.0,
+                   help="Stage B weight on the AP surrogate (top-of-list; 0 disables)")
+    p.add_argument("--w_pairauc", type=float, default=1.0,
+                   help="Stage B weight on the pairwise AUC surrogate (whole-ranking order)")
+    p.add_argument("--pair_cap", type=int, default=65536,
+                   help="Max pos/neg pairs sampled per subgraph by the pairwise AUC loss")
+    p.add_argument("--neg_ratio", type=int, default=50,
+                   help="Negatives per positive per subgraph in Stage B; <=0 uses all negatives")
+    p.add_argument("--edge_select", default="auroc", choices=["auprc", "auroc", "mean"],
+                   help="Validation metric used to pick the Stage B checkpoint")
     p.add_argument("--device",         default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--hidden_dim",     type=int,   default=128)
     p.add_argument("--heads",          type=int,   default=8)
@@ -78,6 +114,33 @@ def parse_args():
     p.add_argument("--dropout",        type=float, default=0.1)
     p.add_argument("--base_name",      default=None,
                    help="Base name for checkpoints/outputs; default: derived from expr file stem")
+    # CHANGED [B2-repro]: --seed for multi-seed ablations
+    # ORIGINAL: no --seed argument
+    p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    # CHANGED [reviewer-ablations]
+    p.add_argument("--skip_pretrain", action="store_true",
+                   help="Skip Stage A; fine-tune from random encoder init "
+                        "(or from --init_ckpt if provided)")
+    p.add_argument("--init_ckpt", default=None,
+                   help="Optional checkpoint to load before Stage A/B "
+                        "(model_state_dict). Use with --skip_pretrain to "
+                        "warm-start Stage B from a baseline run.")
+    p.add_argument("--linear_probe", action="store_true",
+                   help="Run Stage A, then freeze encoder and train edge head only")
+    p.add_argument("--conv_type", default="transformer",
+                   choices=["transformer", "gcn", "gat"],
+                   help="Node encoder convolution (architecture ablation)")
+    p.add_argument("--freeze_split_path", default=None,
+                   help="JSON of pair/TF splits from a reference corr graph (fair corr sweep)")
+    p.add_argument("--input_noise_std", type=float, default=0.1,
+                   help="Gaussian std added to node features x during training (0 disables)")
+    # CHANGED [few-shot]: subsample train positives for Stage B only
+    p.add_argument("--label_frac", type=float, default=1.0,
+                   help="Fraction of unique train positive edges kept for Stage B "
+                        "(1.0 = all). Ignored if --n_shot_pos is set.")
+    p.add_argument("--n_shot_pos", type=int, default=None,
+                   help="Keep exactly this many unique train positives for Stage B "
+                        "(overrides --label_frac). Negatives unchanged.")
     return p.parse_args()
 
 def infer_base_name(expr_path: str, label_path: str, tf_path: str, explicit: str | None = None) -> str:
@@ -115,7 +178,9 @@ def infer_base_name(expr_path: str, label_path: str, tf_path: str, explicit: str
 
 def main():
     args = parse_args()
-    seed_everything(42)
+    # CHANGED [A-seed]
+    # ORIGINAL: seed_everything(42)
+    seed_everything(args.seed)
 
     device = torch.device(args.device)
     print(f"Using device: {device}\n")
@@ -135,21 +200,59 @@ def main():
         hidden_dim=args.hidden_dim,
         heads=args.heads,
         num_layers=args.num_layers,
-        dropout=args.dropout
+        dropout=args.dropout,
+        seed=args.seed,
+        # CHANGED [species-cli]: pass rebuilt priors / text / TF-indicator ablation
+        tf_bind2_path=args.tf_bind2_path,
+        anno_csv_path=args.anno_csv_path,
+        use_tf_indicator=not args.no_tf_indicator,
+        conv_type=args.conv_type,
+        freeze_split_path=args.freeze_split_path,
+        input_noise_std=args.input_noise_std,
+        ablate_go=bool(args.ablate_go or args.expr_only),
+        ablate_text=bool(args.ablate_text or args.expr_only),
+        ablate_tf_bind=bool(args.ablate_tf_bind or args.expr_only),
+        ablate_motif=bool(args.ablate_motif or args.expr_only),
     ).to(device)
 
-    print(f"[CONFIG] hidden_dim={model.node_lin[1].in_features//2} "
+    if args.init_ckpt:
+        ckpt = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
+        state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"[INFO] loaded init_ckpt={args.init_ckpt} "
+              f"(missing={len(missing)} unexpected={len(unexpected)})", flush=True)
+
+    print(f"[CONFIG] hidden_dim={args.hidden_dim} conv_type={args.conv_type} "
           f"heads={getattr(model.convs[0], 'heads', 'N/A')} "
           f"num_layers={len(model.convs)} "
-          f"dropout={model.dropout}")
+          f"dropout={model.dropout} "
+          f"corr_threshold={args.corr_threshold} hops_tf={args.hops_tf} "
+          f"max_nodes_tf={args.max_nodes_tf} "
+          f"mask_ratio={args.mask_ratio} w_mse={args.w_mse} w_pcc={args.w_pcc} w_mae={args.w_mae} "
+          f"skip_pretrain={args.skip_pretrain} linear_probe={args.linear_probe} "
+          f"tf_indicator={not args.no_tf_indicator} freeze_split={args.freeze_split_path} "
+          f"input_noise_std={args.input_noise_std} "
+          f"label_frac={args.label_frac} n_shot_pos={args.n_shot_pos} "
+          f"w_bce={args.w_bce} w_ap={args.w_ap} w_pairauc={args.w_pairauc} pair_cap={args.pair_cap} "
+          f"neg_ratio={args.neg_ratio} edge_select={args.edge_select}")
 
-    # sanitize and prep data
+    # sanitize and prep data; move graph to training device so TF-subgraph
+    # BFS + edge induction run on GPU when --device cuda.
     g_main = _sanitize_graph(model.data)
     ensure_pos_emb_capacity(model, g_main.x.size(0))
+    g_main = g_main.to(device)
+    model.data = g_main
+    print(
+        f"[INFO] subgraph extract on {device}: "
+        f"E={int(g_main.edge_index.size(1))} N={int(g_main.x.size(0))}",
+        flush=True,
+    )
 
-    # build TF-centric subgraphs/pools
-    tf_subgraphs = extract_tf_subgraphs(g_main, num_hops=args.hops_tf)
-    train_tf_pools = [tf_subgraphs]
+    # Split-isolated TF-centered subgraphs: hop-fill to max_nodes inside each split
+    splits = extract_tf_subgraphs(
+        g_main, num_hops=args.hops_tf, max_nodes=args.max_nodes_tf, seed=args.seed
+    )
+    train_subs, val_subs, test_subs = splits["train"], splits["val"], splits["test"]
 
     # ─────────────── Stage A: Pretraining ───────────────
     if hasattr(model, "classifier"):
@@ -162,11 +265,27 @@ def main():
         model.freeze_encoder(False)
 
     print("\n=== Stage A: Pretraining on masked gene expression ===")
-    _ = train_expr_only(
-        model, train_tf_pools, device,
-        max_epochs=50, patience=args.patience,
-        MASK_RATIO_TRAIN=0.1, MASK_RATIO_VAL=0.1,
-        w_mse=1.0, w_pcc=1.0, base_lr=model.lr, wd=1e-4
+    if args.skip_pretrain:
+        if args.init_ckpt:
+            print(f"[INFO] --skip_pretrain: skipping Stage A (warm-start from {args.init_ckpt})")
+        else:
+            print("[INFO] --skip_pretrain: skipping Stage A (random encoder init)")
+    else:
+        _ = train_expr_only(
+            model, train_subs, device,
+            max_epochs=50, patience=args.patience,
+            MASK_RATIO_TRAIN=args.mask_ratio, MASK_RATIO_VAL=args.mask_ratio,
+            w_mse=args.w_mse, w_pcc=args.w_pcc, w_mae=args.w_mae,
+            base_lr=model.lr, wd=1e-4,
+            val_subs=val_subs,
+        )
+
+    # Few-shot: after Stage A, restrict train positives seen by Stage B
+    few_shot_info = apply_few_shot_train_positives(
+        train_subs,
+        seed=args.seed,
+        label_frac=args.label_frac,
+        n_shot_pos=args.n_shot_pos,
     )
 
     # ─────────────── Stage B: Fine-tuning edges ───────────────
@@ -179,22 +298,87 @@ def main():
     if hasattr(model, "reinit_edge_head"):
         model.reinit_edge_head()
     if hasattr(model, "freeze_encoder"):
-        model.freeze_encoder(False)
+        model.freeze_encoder(bool(args.linear_probe))
 
     print("\n=== Stage B: Fine-tuning on edge prediction ===")
+    if args.linear_probe:
+        print("[INFO] --linear_probe: encoder frozen; training edge head only")
     _ = finetune_edge_only(
-        model, train_tf_pools, device,
+        model, train_subs, device,
         max_epochs=args.max_epochs, patience=args.patience,
         base_lr_encoder=2e-4,
         base_lr_head=5e-4,
-        wd=1e-4
+        wd=1e-4,
+        freeze_encoder_ft=bool(args.linear_probe),
+        val_subs=val_subs,
+        w_bce=args.w_bce, w_ap=args.w_ap, w_pairauc=args.w_pairauc, pair_cap=args.pair_cap,
+        neg_ratio=args.neg_ratio, edge_select=args.edge_select,
     )
+
+    # CHANGED [A10-checkpoint]: save after Stage B (README expected this file).
+    # ORIGINAL: no checkpoint save
+    ckpt_path = f"{base_name}_pretrained_weight.pt"
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "base_name": base_name,
+            "hidden_dim": args.hidden_dim,
+            "heads": args.heads,
+            "num_layers": args.num_layers,
+            "dropout": args.dropout,
+            "corr_threshold": args.corr_threshold,
+            "hops_tf": args.hops_tf,
+            "max_nodes_tf": args.max_nodes_tf,
+            "mask_ratio": args.mask_ratio,
+            "w_mse": args.w_mse,
+            "w_pcc": args.w_pcc,
+            "w_mae": args.w_mae,
+            "freeze_split_path": args.freeze_split_path,
+            "seed": args.seed,
+            "conv_type": args.conv_type,
+            "skip_pretrain": args.skip_pretrain,
+            "linear_probe": args.linear_probe,
+            "use_tf_indicator": not args.no_tf_indicator,
+            "input_noise_std": args.input_noise_std,
+            "label_frac": args.label_frac,
+            "n_shot_pos": args.n_shot_pos,
+            "few_shot": few_shot_info,
+            "w_bce": args.w_bce,
+            "w_ap": args.w_ap,
+            "w_pairauc": args.w_pairauc,
+            "pair_cap": args.pair_cap,
+            "neg_ratio": args.neg_ratio,
+            "edge_select": args.edge_select,
+            "priors_path": args.priors_path,
+            "anno_csv_path": args.anno_csv_path,
+        },
+        ckpt_path,
+    )
+    print(f"[INFO] Checkpoint saved → {ckpt_path}")
 
     # ─────────────── Evaluate ───────────────
     model.eval()
     model.data = g_main.to(device)
-    bootstrap_out = bootstrap_test(model, g_main, device, base_name=base_name)
-    bootstrap_evaluation_best_thresh(f"{base_name}_prediction.csv", 100)
+    bootstrap_out = bootstrap_test(
+        model, g_main, device, base_name=base_name,
+        test_subs=test_subs, mask_ratio=args.mask_ratio,
+    )
+
+    # F1 threshold from val subgraphs: encode and score inside the val split
+    val_probs, val_labels = collect_split_edge_arrays(
+        model, val_subs, device, tf_only=True,
+        tf_indices=g_main.tf_indices, gene_names=list(g_main.gene_names),
+    )
+    if val_probs.size == 0:
+        val_probs = val_labels = None
+
+    bootstrap_evaluation_best_thresh(
+        f"{base_name}_prediction.csv",
+        n_bootstraps=100,
+        val_probs=val_probs,
+        val_labels=val_labels,
+        seed=args.seed,
+    )
 
 
 if __name__ == "__main__":

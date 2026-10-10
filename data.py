@@ -9,31 +9,227 @@ from torch_geometric.data import Data
 from collections import defaultdict
 from transformers import AutoTokenizer, AutoModel
 from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
-from torch_geometric.utils import k_hop_subgraph
+_SPLIT_SEED = {"train": 0, "val": 1, "test": 2}
 
-def extract_tf_subgraphs(data, num_hops=5):
-        subgraphs = {}
-        N = data.x.size(0)
-        for tf_idx in data.tf_indices:
-            subset, ei, mapping, mask = k_hop_subgraph(
-                node_idx=tf_idx,
-                num_hops=num_hops,
-                edge_index=data.edge_index,
-                relabel_nodes=True,
-                num_nodes=N,
-                flow='source_to_target'
-            )
-            subgraphs[tf_idx] = {
-                "x": data.x[subset],
-                "edge_index": ei,
-                "edge_attr": data.edge_attr[mask],
-                "y": data.y[mask],
-                "train_mask": data.train_mask[mask],
-                "val_mask":   data.val_mask[mask],
-                "test_mask":  data.test_mask[mask],
-                "subset":     subset,
-            }
+
+def _bfs_hop_layers(center, edge_index, num_nodes, max_hops):
+    """Return [layer0=TF, layer1=1-hop, ...] using only edge_index."""
+    device = edge_index.device
+    src, dst = edge_index[0], edge_index[1]
+    seen = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+    center = int(center)
+    seen[center] = True
+    layers = [torch.tensor([center], dtype=torch.long, device=device)]
+    frontier = layers[0]
+    for _ in range(max_hops):
+        if frontier.numel() == 0 or src.numel() == 0:
+            break
+        is_front = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+        is_front[frontier] = True
+        neigh = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+        neigh[dst[is_front[src]]] = True
+        new_idx = (neigh & ~seen).nonzero(as_tuple=False).view(-1)
+        if new_idx.numel() == 0:
+            break
+        layers.append(new_idx)
+        seen[new_idx] = True
+        frontier = new_idx
+    return layers
+
+
+def _hop_fill_groups(layers, max_nodes, generator):
+    """Fill hops in order until max_nodes. Overflow hops are packed without replacement.
+
+    Stays on the device of ``layers`` (CPU or CUDA).
+    """
+    device = layers[0].device
+    tf = layers[0].reshape(-1)
+    leftovers = [layer.reshape(-1).clone() for layer in layers[1:]]
+    if all(layer.numel() == 0 for layer in leftovers):
+        return [tf]
+
+    groups = []
+    while True:
+        parts = [tf]
+        n_keep = 1
+        progressed = False
+        for h, layer in enumerate(leftovers):
+            if layer.numel() == 0:
+                continue
+            room = max_nodes - n_keep
+            if room <= 0:
+                break
+            if layer.numel() <= room:
+                parts.append(layer)
+                n_keep += int(layer.numel())
+                leftovers[h] = layer[:0]
+                progressed = True
+            else:
+                # Generator may be CPU-only on some builds; fall back to seeded CPU perm.
+                try:
+                    perm = torch.randperm(layer.numel(), generator=generator, device=device)
+                except (RuntimeError, TypeError):
+                    perm = torch.randperm(layer.numel(), generator=generator).to(device)
+                parts.append(layer[perm[:room]])
+                leftovers[h] = layer[perm[room:]]
+                n_keep += room
+                progressed = True
+                break
+        if n_keep <= 1 and not progressed:
+            break
+        if n_keep <= 1:
+            break
+        groups.append(torch.cat(parts, dim=0))
+        if all(layer.numel() == 0 for layer in leftovers):
+            break
+    return groups if groups else [tf]
+
+
+def _hop_lookup(layers, num_nodes, device):
+    """hop_of[node] = BFS layer index (0 = center TF); -1 for nodes outside the layers."""
+    hop_of = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
+    for h, layer in enumerate(layers):
+        if layer.numel() > 0:
+            hop_of[layer.to(device)] = h
+    return hop_of
+
+
+def _tfs_touched_by_mask(data, split_mask):
+    if not bool(split_mask.any()):
+        return []
+    # Keep unique node discovery on the edge_index device (GPU-friendly).
+    src = data.edge_index[0, split_mask]
+    dst = data.edge_index[1, split_mask]
+    touched = torch.zeros(data.x.size(0), dtype=torch.bool, device=src.device)
+    touched[src] = True
+    touched[dst] = True
+    out = []
+    for tf in data.tf_indices:
+        ti = int(tf)
+        if ti < touched.numel() and bool(touched[ti]):
+            out.append(ti)
+    return out
+
+
+def _record_from_global_nodes(data, keep_global, split_name, hop_dist):
+    """Induce all coexpression edges among keep_global; copy global ChIP-split masks.
+
+    Message passing sees the full |corr| graph among the subset. Train/val/test
+    masks stay on the original TF-wise label split and are used only for scoring.
+    All tensor ops follow ``data.edge_index.device`` (CPU or CUDA).
+    """
+    device = data.edge_index.device
+    keep_global = keep_global.long().reshape(-1).to(device)
+    N = data.x.size(0)
+    new_id = torch.full((N,), -1, dtype=torch.long, device=device)
+    new_id[keep_global] = torch.arange(keep_global.numel(), device=device)
+    src = data.edge_index[0]
+    dst = data.edge_index[1]
+    edge_keep = (new_id[src] >= 0) & (new_id[dst] >= 0)
+    ei = torch.stack([new_id[src[edge_keep]], new_id[dst[edge_keep]]], dim=0)
+    train_m = data.train_mask.to(device)[edge_keep]
+    val_m = data.val_mask.to(device)[edge_keep]
+    test_m = data.test_mask.to(device)[edge_keep]
+    y = data.y.to(device)[edge_keep]
+    ea = data.edge_attr.to(device)[edge_keep]
+    x = data.x.to(device)[keep_global]
+    hops = hop_dist.to(device)
+    return {
+        "x": x,
+        "edge_index": ei,
+        "edge_attr": ea,
+        "y": y,
+        "train_mask": train_m,
+        "val_mask": val_m,
+        "test_mask": test_m,
+        "subset": keep_global,
+        "n_id": keep_global,
+        "hop_dist": hops,
+        "split": split_name,
+    }
+
+
+def extract_split_tf_subgraphs(data, split, num_hops=2, max_nodes=100, seed=42):
+    if max_nodes < 1:
+        raise ValueError(f"max_nodes must be >= 1, got {max_nodes}")
+    split_mask = getattr(data, f"{split}_mask")
+    subgraphs = {}
+    if not bool(split_mask.any()):
         return subgraphs
+    N = data.x.size(0)
+    full_ei = data.edge_index
+    device = full_ei.device
+    tfs = _tfs_touched_by_mask(data, split_mask)
+    n_multi = 0
+    sizes = []
+    # Prefer a device-local Generator; fall back to CPU if CUDA generators unavailable.
+    try:
+        rng = torch.Generator(device=device)
+    except (RuntimeError, TypeError):
+        rng = torch.Generator(device="cpu")
+    for tf_idx in tfs:
+        layers = _bfs_hop_layers(tf_idx, full_ei, N, num_hops)
+        hop_of = _hop_lookup(layers, N, device)
+        rng.manual_seed(int(seed) + int(tf_idx) + 1_000_003 * _SPLIT_SEED.get(split, 0))
+        groups = _hop_fill_groups(layers, max_nodes, rng)
+        if len(groups) > 1:
+            n_multi += 1
+        sizes.append(int(sum(int(layer.numel()) for layer in layers)))
+        for part_i, keep_global in enumerate(groups):
+            hops = hop_of[keep_global.to(device)].clamp_min(0)
+            rec = _record_from_global_nodes(data, keep_global, split, hops)
+            rec["center_tf"] = int(tf_idx)
+            subgraphs[(int(tf_idx), part_i)] = rec
+    if tfs:
+        filled = [int(sub["subset"].numel()) for sub in subgraphs.values()] or [0]
+        print(
+            f"[INFO] TF-subgraphs split={split}: device={device} max_hops={num_hops} "
+            f"max_nodes={max_nodes} seed={seed}; n_tf={len(tfs)}; "
+            f"n_subgraphs={len(subgraphs)}; multi_tf={n_multi}; "
+            f"filled node range [{min(filled)}, {max(filled)}]; "
+            f"raw hop-union range [{min(sizes)}, {max(sizes)}]; "
+            f"mp=full_coexp_among_subset score_split={split}",
+            flush=True,
+        )
+    return subgraphs
+
+
+def extract_tf_subgraphs(data, num_hops=2, max_nodes=100, seed=42):
+    """TF-centered subgraphs on the full coexpression graph; labels stay TF-split."""
+    return {
+        "train": extract_split_tf_subgraphs(
+            data, "train", num_hops=num_hops, max_nodes=max_nodes, seed=seed
+        ),
+        "val": extract_split_tf_subgraphs(
+            data, "val", num_hops=num_hops, max_nodes=max_nodes, seed=seed
+        ),
+        "test": extract_split_tf_subgraphs(
+            data, "test", num_hops=num_hops, max_nodes=max_nodes, seed=seed
+        ),
+    }
+
+def freeze_split_from_data(data, ref_corr_threshold: float, seed: int) -> dict:
+    """Serialize train/val/test assignment as gene-name pair keys."""
+    genes = list(data.gene_names)
+    src, dst = data.edge_index.cpu().numpy()
+    pair_to_split = {}
+    tf_to_split = {}
+    tf_set = {int(i) for i in data.tf_indices}
+    for split in ("train", "val", "test"):
+        mask = getattr(data, f"{split}_mask").cpu().numpy()
+        for e in np.nonzero(mask)[0]:
+            a, b = genes[int(src[e])], genes[int(dst[e])]
+            pair_to_split["|".join(sorted([a, b]))] = split
+            if int(src[e]) in tf_set:
+                tf_to_split.setdefault(genes[int(src[e])], split)
+            if int(dst[e]) in tf_set:
+                tf_to_split.setdefault(genes[int(dst[e])], split)
+    return {
+        "ref_corr_threshold": float(ref_corr_threshold),
+        "seed": int(seed),
+        "pair_to_split": pair_to_split,
+        "tf_to_split": tf_to_split,
+    }
 
 def _sanitize_graph(g):
     g.x         = torch.nan_to_num(g.x, nan=0.0, posinf=1e6, neginf=-1e6)
@@ -59,7 +255,9 @@ def make_paths(base_name):
         f"{base_name}_ExpressionData.csv",
         f"{base_name}_refNetwork.csv",
         f"{base_name}_TFs.csv",
-        "go_term.csv",
+        # CHANGED [A11-filename]: was "go_term.csv"; matches main.py / README (gene_go_pairs.csv).
+        # ORIGINAL: "go_term.csv",
+        "gene_go_pairs.csv",
         "tf_binding_logodds.csv"
     )
 
@@ -76,6 +274,18 @@ def load_data(
     llama_batch_size: int = 16,
     llama_max_tokens: int = 256,
     test_pair_path: str | None = None,
+    # CHANGED [A-seed]: expose seed for multi-seed ablations.
+    # ORIGINAL: (no parameter; seed = 42 hard-coded below)
+    seed: int = 42,
+    # CHANGED [A7-tf-indicator]: gate tf_indicator for ablation of TF-identity shortcut.
+    # ORIGINAL: (always included; no parameter)
+    use_tf_indicator: bool = True,
+    freeze_split: dict | None = None,
+    # Feature ablations (zero the block; keep dims so the architecture matches full).
+    ablate_go: bool = False,
+    ablate_text: bool = False,
+    ablate_tf_bind: bool = False,
+    ablate_motif: bool = False,
 ):
     import os
     import random
@@ -90,7 +300,8 @@ def load_data(
     from transformers import AutoTokenizer, AutoModel
     from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
 
-    seed = 42
+    # CHANGED [A-seed]: was hard-coded to 42; now uses the seed parameter.
+    # ORIGINAL: seed = 42
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -98,7 +309,9 @@ def load_data(
     def _build_llama_text_embeddings(
         anno_csv_path: str,
         genes: list[str],
-        model_name: str = "meta-llama/Llama-3.2-1B",
+        # CHANGED [A5-log-encoder]: default matches what actually runs (MiniLM), not LLaMA.
+        # ORIGINAL: model_name: str = "meta-llama/Llama-3.2-1B",
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
         batch_size: int = 16,
         max_tokens: int = 256,
         cache_key: str | None = None,
@@ -154,6 +367,9 @@ def load_data(
             tok = AutoTokenizer.from_pretrained(model_name_try, use_fast=True)
             mdl = AutoModel.from_pretrained(model_name_try).to(device)
             mdl.eval()
+            # CHANGED [A5-log-encoder]: log which encoder actually loads.
+            # ORIGINAL: (no logging)
+            print(f"[TEXT-EMB] Using encoder: {model_name_try}")
 
             outs = []
             with torch.no_grad():
@@ -180,8 +396,9 @@ def load_data(
             np.save(cp, emb)
             return emb
 
+        # CHANGED [A5-log-encoder]: MiniLM is the explicit default above; fallbacks are others.
+        # ORIGINAL: fallbacks started with all-MiniLM-L6-v2 (first fallback after gated LLaMA).
         fallbacks = [
-            "sentence-transformers/all-MiniLM-L6-v2",
             "intfloat/e5-base-v2",
             "BAAI/bge-small-en-v1.5",
         ]
@@ -268,6 +485,13 @@ def load_data(
             s = str(x)
             return gene_to_idx.get(s, gene_to_idx.get(s.split(".", 1)[0]))
 
+        def _gene_from_fimo_seq(x):
+            """FIMO/BED sequence_name often looks like GENE(+) or GENE(-)."""
+            if pd.isna(x):
+                return None
+            g = str(x).split("(")[0].strip().split("::")[0]
+            return gene_to_idx.get(g, gene_to_idx.get(g.split(".", 1)[0]))
+
         if {"motif_alt_id", "sequence_name"}.issubset(cols):
             if "score" in cols:
                 b2 = b2[["motif_alt_id", "sequence_name", "score"]].rename(
@@ -280,13 +504,15 @@ def load_data(
                 b2["best_score"] = -np.log10(b2["p-value"].astype(float).clip(lower=1e-300))
             else:
                 raise ValueError("tf_bind2_path: need 'score' or 'p-value' in FIMO file")
+            map_gene = _gene_from_fimo_seq
         elif {"gene", "tf_name", "score_max"}.issubset(cols):
             b2 = b2.rename(columns={"tf_name": "motif", "score_max": "best_score"})
+            map_gene = _idx
         else:
             raise ValueError("tf_bind2_path: unrecognized columns")
 
         b2["s"] = b2["motif"].map(_idx)
-        b2["d"] = b2["gene"].map(_idx)
+        b2["d"] = b2["gene"].map(map_gene)
         b2 = b2.dropna(subset=["s", "d", "best_score"]).groupby(
             ["s", "d"], as_index=False
         )["best_score"].max()
@@ -330,10 +556,13 @@ def load_data(
 
         corr_vals = np.array([corr_mat[s, d] for s, d in pair_rows], dtype=np.float32)
         bind_vals = np.array([bind_dict.get((s, d), 0.0) for s, d in pair_rows], dtype=np.float32)
-
+        if ablate_tf_bind:
+            bind_vals = np.zeros_like(bind_vals)
         edge_cols = [corr_vals, bind_vals]
         if bind2_dict is not None:
             bind2_vals = np.array([bind2_dict.get((s, d), 0.0) for s, d in pair_rows], dtype=np.float32)
+            if ablate_motif:
+                bind2_vals = np.zeros_like(bind2_vals)
             edge_cols.append(bind2_vals)
 
         edge_attr = torch.tensor(np.stack(edge_cols, axis=1), dtype=torch.float32)
@@ -344,19 +573,27 @@ def load_data(
             degrees[s] += 1
             degrees[d] += 1
 
-        tf_indicator = np.zeros((N, 1), dtype=np.float32)
-        if tf_indices:
-            tf_indicator[np.array(tf_indices, dtype=int)] = 1.0
+        # CHANGED [A7-tf-indicator]: conditional on use_tf_indicator
+        # ORIGINAL: always included tf_indicator
+        go_use = go_mat.astype(np.float32, copy=False)
+        if ablate_go:
+            go_use = np.zeros_like(go_use)
 
         feats = [
             expr_np,
-            go_mat.astype(np.float32, copy=False),
+            go_use,
             degrees[:, None],
-            tf_indicator,
         ]
+        if use_tf_indicator:
+            tf_indicator = np.zeros((N, 1), dtype=np.float32)
+            if tf_indices:
+                tf_indicator[np.array(tf_indices, dtype=int)] = 1.0
+            feats.append(tf_indicator)
 
         if anno_csv_path is not None:
-            model_name = llama_model or "meta-llama/Llama-3.2-1B"
+            # CHANGED [A5-log-encoder]: default MiniLM
+            # ORIGINAL: model_name = llama_model or "meta-llama/Llama-3.2-1B"
+            model_name = llama_model or "sentence-transformers/all-MiniLM-L6-v2"
             text_emb = _build_llama_text_embeddings(
                 anno_csv_path=anno_csv_path,
                 genes=genes,
@@ -365,6 +602,8 @@ def load_data(
                 max_tokens=llama_max_tokens,
                 cache_key=os.path.basename(expr_path),
             )
+            if ablate_text:
+                text_emb = np.zeros_like(text_emb)
             feats.append(text_emb.astype(np.float32, copy=False))
 
         X = np.hstack(feats)
@@ -400,7 +639,10 @@ def load_data(
     # Normal training/eval mode
     # ─────────────────────────────────────────────────────────────
     iu, ju = np.triu_indices(N, k=1)
-    mask = corr_mat[iu, ju] >= corr_threshold
+    # CHANGED [A1-abs-corr]: was signed >= corr_threshold, which dropped all repressive
+    # (negatively correlated) edges. Now uses magnitude; signed corr kept as edge feature.
+    # ORIGINAL: mask = corr_mat[iu, ju] >= corr_threshold
+    mask = np.abs(corr_mat[iu, ju]) >= corr_threshold
 
     src = np.concatenate([iu[mask], ju[mask]])
     dst = np.concatenate([ju[mask], iu[mask]])
@@ -441,9 +683,12 @@ def load_data(
         count=E0
     )
 
-    n_bad = int((corr_vals < corr_threshold).sum())
+    # CHANGED [A1-abs-corr]: invariant uses abs so repressive edges do not false-alarm.
+    # ORIGINAL: n_bad = int((corr_vals < corr_threshold).sum())
+    #           raise ... "corr < corr_threshold"
+    n_bad = int((np.abs(corr_vals) < corr_threshold).sum())
     if n_bad != 0:
-        raise RuntimeError(f"Found {n_bad} edges with corr < corr_threshold after filtering (bug).")
+        raise RuntimeError(f"Found {n_bad} edges with |corr| < corr_threshold after filtering (bug).")
 
     tf_to_edges = defaultdict(list)
     for e, (s, d) in enumerate(zip(src, dst)):
@@ -452,92 +697,117 @@ def load_data(
         if d in tf_set and d != s:
             tf_to_edges[d].append(e)
 
-    total_edges = E0
-    total_pos = int(y_np.sum())
-    targets = {
-        "train": {"edges": int(round(0.70 * total_edges)), "pos": int(round(0.70 * total_pos))},
-        "val":   {"edges": int(round(0.15 * total_edges)), "pos": int(round(0.15 * total_pos))},
-        "test":  {"edges": total_edges,                   "pos": total_pos},
-    }
-    targets["test"]["edges"] -= (targets["train"]["edges"] + targets["val"]["edges"])
-    targets["test"]["pos"] -= (targets["train"]["pos"] + targets["val"]["pos"])
-
-    splits = {"train": set(), "val": set(), "test": set()}
-    stats = {
-        "train": {"edges": 0, "pos": 0},
-        "val": {"edges": 0, "pos": 0},
-        "test": {"edges": 0, "pos": 0}
-    }
-
-    tf_order = sorted(
-        tf_to_edges,
-        key=lambda tf: (-len(tf_to_edges[tf]), -int(sum(y_np[e] for e in tf_to_edges[tf])))
-    )
-
-    for tf in tf_order:
-        n_e = len(tf_to_edges[tf])
-        n_p = int(sum(y_np[e] for e in tf_to_edges[tf]))
-        best_split, best_score = None, float("inf")
-
-        for split in ("train", "val", "test"):
-            frac_e = stats[split]["edges"] / (targets[split]["edges"] or 1)
-            frac_p = stats[split]["pos"] / (targets[split]["pos"] or 1)
-            score = frac_e + frac_p
-            if score < best_score:
-                best_score, best_split = score, split
-
-        splits[best_split].add(tf)
-        stats[best_split]["edges"] += n_e
-        stats[best_split]["pos"] += n_p
-
-    tf_to_split = {tf: split for split in splits for tf in splits[split]}
-
-    undirected_gene_gene = defaultdict(list)
-    for e, (s, d) in enumerate(zip(src, dst)):
-        if (s not in tf_set) and (d not in tf_set):
-            undirected_gene_gene[frozenset((s, d))].append(e)
-
-    all_gg = list(undirected_gene_gene.keys())
-    rng = np.random.default_rng(seed)
-    rng.shuffle(all_gg)
-
-    n_train = int(0.7 * len(all_gg))
-    n_val = int(0.15 * len(all_gg))
-    gg_split = {}
-
-    for i, key in enumerate(all_gg):
-        bucket = "train" if i < n_train else ("val" if i < n_train + n_val else "test")
-        for e in undirected_gene_gene[key]:
-            gg_split[e] = bucket
+    freeze_pairs = (freeze_split or {}).get("pair_to_split")
+    freeze_tf = (freeze_split or {}).get("tf_to_split")
 
     keep_mask = np.zeros(E0, dtype=bool)
     owned_split = np.empty(E0, dtype=object)
 
-    for e, (s, d) in enumerate(zip(src, dst)):
-        if (s in tf_set) and (d in tf_set):
-            if tf_to_split.get(s) != tf_to_split.get(d):
-                owned_split[e] = None
-                keep_mask[e] = False
+    if freeze_pairs is not None:
+        print(f"[INFO] Frozen split from corr={freeze_split.get('ref_corr_threshold')} "
+              f"({len(freeze_pairs)} undirected pairs); new edges → train, never test")
+        name_of = genes
+        for e, (s, d) in enumerate(zip(src, dst)):
+            key = "|".join(sorted([name_of[s], name_of[d]]))
+            if key in freeze_pairs:
+                owned_split[e] = freeze_pairs[key]
+                keep_mask[e] = True
                 continue
-            assigned = tf_to_split[s]
-        elif s in tf_set:
-            assigned = tf_to_split[s]
-        elif d in tf_set:
-            assigned = tf_to_split[d]
-        else:
-            assigned = gg_split.get(e, "train")
+            if (s in tf_set) and (d in tf_set) and freeze_tf is not None:
+                ss = freeze_tf.get(name_of[s])
+                ds = freeze_tf.get(name_of[d])
+                if ss is not None and ds is not None and ss != ds:
+                    owned_split[e] = None
+                    keep_mask[e] = False
+                    continue
+            owned_split[e] = "train"
+            keep_mask[e] = True
+    else:
+        total_edges = E0
+        total_pos = int(y_np.sum())
+        targets = {
+            "train": {"edges": int(round(0.70 * total_edges)), "pos": int(round(0.70 * total_pos))},
+            "val":   {"edges": int(round(0.15 * total_edges)), "pos": int(round(0.15 * total_pos))},
+            "test":  {"edges": total_edges,                   "pos": total_pos},
+        }
+        targets["test"]["edges"] -= (targets["train"]["edges"] + targets["val"]["edges"])
+        targets["test"]["pos"] -= (targets["train"]["pos"] + targets["val"]["pos"])
 
-        owned_split[e] = assigned
-        keep_mask[e] = True
+        splits = {"train": set(), "val": set(), "test": set()}
+        stats = {
+            "train": {"edges": 0, "pos": 0},
+            "val": {"edges": 0, "pos": 0},
+            "test": {"edges": 0, "pos": 0}
+        }
 
-    lowcorr_pos = (y_np == 1) & (corr_vals < corr_threshold)
-    is_test = (owned_split == "test")
-    drop_test_lowcorr_pos = lowcorr_pos & is_test
+        tf_order = sorted(
+            tf_to_edges,
+            key=lambda tf: (-len(tf_to_edges[tf]), -int(sum(y_np[e] for e in tf_to_edges[tf])))
+        )
 
-    if drop_test_lowcorr_pos.any():
-        print(f"[SPLIT-FIX] Dropping {int(drop_test_lowcorr_pos.sum())} test positives with corr < {corr_threshold}.")
-        keep_mask[drop_test_lowcorr_pos] = False
-        owned_split[drop_test_lowcorr_pos] = None
+        for tf in tf_order:
+            n_e = len(tf_to_edges[tf])
+            n_p = int(sum(y_np[e] for e in tf_to_edges[tf]))
+            best_split, best_score = None, float("inf")
+
+            for split in ("train", "val", "test"):
+                frac_e = stats[split]["edges"] / (targets[split]["edges"] or 1)
+                frac_p = stats[split]["pos"] / (targets[split]["pos"] or 1)
+                score = frac_e + frac_p
+                if score < best_score:
+                    best_score, best_split = score, split
+
+            splits[best_split].add(tf)
+            stats[best_split]["edges"] += n_e
+            stats[best_split]["pos"] += n_p
+
+        tf_to_split = {tf: split for split in splits for tf in splits[split]}
+
+        undirected_gene_gene = defaultdict(list)
+        for e, (s, d) in enumerate(zip(src, dst)):
+            if (s not in tf_set) and (d not in tf_set):
+                undirected_gene_gene[frozenset((s, d))].append(e)
+
+        all_gg = list(undirected_gene_gene.keys())
+        rng = np.random.default_rng(seed)
+        rng.shuffle(all_gg)
+
+        n_train = int(0.7 * len(all_gg))
+        n_val = int(0.15 * len(all_gg))
+        gg_split = {}
+
+        for i, key in enumerate(all_gg):
+            bucket = "train" if i < n_train else ("val" if i < n_train + n_val else "test")
+            for e in undirected_gene_gene[key]:
+                gg_split[e] = bucket
+
+        for e, (s, d) in enumerate(zip(src, dst)):
+            if (s in tf_set) and (d in tf_set):
+                if tf_to_split.get(s) != tf_to_split.get(d):
+                    owned_split[e] = None
+                    keep_mask[e] = False
+                    continue
+                assigned = tf_to_split[s]
+            elif s in tf_set:
+                assigned = tf_to_split[s]
+            elif d in tf_set:
+                assigned = tf_to_split[d]
+            else:
+                assigned = gg_split.get(e, "train")
+
+            owned_split[e] = assigned
+            keep_mask[e] = True
+
+    # CHANGED [A1-abs-corr]: removed lowcorr_pos drop of test positives with signed
+    # corr < threshold. Under abs filter, negatively correlated positives are valid.
+    # ORIGINAL:
+    #   lowcorr_pos = (y_np == 1) & (corr_vals < corr_threshold)
+    #   is_test = (owned_split == "test")
+    #   drop_test_lowcorr_pos = lowcorr_pos & is_test
+    #   if drop_test_lowcorr_pos.any():
+    #       print(...)
+    #       keep_mask[drop_test_lowcorr_pos] = False
+    #       owned_split[drop_test_lowcorr_pos] = None
 
     src = src[keep_mask]
     dst = dst[keep_mask]
@@ -558,13 +828,24 @@ def load_data(
     val_mask_bool = (owned_split == "val")
     test_mask_bool = (owned_split == "test")
 
-    bad_test = int(((y_np == 1) & (corr_vals < corr_threshold) & test_mask_bool).sum())
-    print("[CHECK] low-corr positives in TEST:", bad_test)
+    # CHANGED [A1-abs-corr]: use abs in check.
+    # ORIGINAL: bad_test = int(((y_np == 1) & (corr_vals < corr_threshold) & test_mask_bool).sum())
+    #           print("[CHECK] low-corr positives in TEST:", bad_test)
+    bad_test = int(((y_np == 1) & (np.abs(corr_vals) < corr_threshold) & test_mask_bool).sum())
+    print("[CHECK] low-|corr| positives in TEST:", bad_test)
 
-    # edge normalization stats from train split
-    edge_cols_norm = [corr_vals.astype(np.float32, copy=False), bind_vals.astype(np.float32, copy=False)]
+    # CHANGED [A11-wire-edge-norm]: compute normalised edge features and use them as
+    # primary edge_attr (raw previously fed to model; EF_norm was stored unused).
+    # ORIGINAL: edge_attr built from raw [corr_vals, bind_vals, ...]; EF_norm unused.
+    bind_use = bind_vals.astype(np.float32, copy=True)
+    if ablate_tf_bind:
+        bind_use[:] = 0.0
+    edge_cols_norm = [corr_vals.astype(np.float32, copy=False), bind_use]
     if bind2_dict is not None:
-        edge_cols_norm.append(bind2_vals.astype(np.float32, copy=False))
+        bind2_use = bind2_vals.astype(np.float32, copy=True)
+        if ablate_motif:
+            bind2_use[:] = 0.0
+        edge_cols_norm.append(bind2_use)
 
     EF = np.stack(edge_cols_norm, axis=1).astype(np.float32, copy=False)
     EF[:, 0] = np.arctanh(np.clip(EF[:, 0], -0.999999, 0.999999))
@@ -590,18 +871,31 @@ def load_data(
         "transform": "corr->atanh; bind->signed log1p; zscore(train); clip±5"
     }
 
+    # CHANGED [A8-degree-leakage]: degree from train_mask edges only (not all splits).
+    # ORIGINAL: for s, d in zip(src, dst): degrees[s/d] += 1
+    train_src = src[train_mask_bool]
+    train_dst = dst[train_mask_bool]
     degrees = np.zeros(N, dtype=np.float32)
-    for s, d in zip(src, dst):
+    for s, d in zip(train_src, train_dst):
         degrees[s] += 1
         degrees[d] += 1
 
-    tf_indicator = np.zeros((N, 1), dtype=np.float32)
-    if tf_indices:
-        tf_indicator[np.array(tf_indices, dtype=int)] = 1.0
+    # CHANGED [A7-tf-indicator]: gate behind use_tf_indicator
+    # ORIGINAL: always appended tf_indicator
+    go_use = go_mat.astype(np.float32, copy=False)
+    if ablate_go:
+        go_use = np.zeros_like(go_use)
+    feats = [expr_np, go_use, degrees[:, None]]
+    if use_tf_indicator:
+        tf_indicator = np.zeros((N, 1), dtype=np.float32)
+        if tf_indices:
+            tf_indicator[np.array(tf_indices, dtype=int)] = 1.0
+        feats.append(tf_indicator)
 
-    feats = [expr_np, go_mat.astype(np.float32, copy=False), degrees[:, None], tf_indicator]
     if anno_csv_path is not None:
-        model_name = llama_model or "meta-llama/Llama-3.2-1B"
+        # CHANGED [A5-log-encoder]: MiniLM default
+        # ORIGINAL: model_name = llama_model or "meta-llama/Llama-3.2-1B"
+        model_name = llama_model or "sentence-transformers/all-MiniLM-L6-v2"
         text_emb = _build_llama_text_embeddings(
             anno_csv_path=anno_csv_path,
             genes=genes,
@@ -610,16 +904,25 @@ def load_data(
             max_tokens=llama_max_tokens,
             cache_key=os.path.basename(expr_path),
         )
+        if ablate_text:
+            text_emb = np.zeros_like(text_emb)
         feats.append(text_emb.astype(np.float32, copy=False))
 
     X = np.hstack(feats)
     x_tensor = torch.tensor(X, dtype=torch.float32)
+    if ablate_go or ablate_text or ablate_tf_bind or ablate_motif:
+        print(
+            f"[ABLATION] go={ablate_go} text={ablate_text} "
+            f"tf_bind={ablate_tf_bind} motif={ablate_motif}"
+        )
 
-    # keep raw edge_attr behavior from your original code
-    edge_feats = [corr_vals, bind_vals]
-    if bind2_dict is not None:
-        edge_feats.append(bind2_vals)
-    edge_attr = torch.tensor(np.stack(edge_feats, axis=1), dtype=torch.float32)
+    # CHANGED [A11-wire-edge-norm]: edge_attr = normalised; raw kept as edge_attr_raw
+    # ORIGINAL: edge_attr from raw stack; data.edge_attr_norm = EF_norm (unused by model)
+    edge_attr = torch.tensor(EF_norm, dtype=torch.float32)
+    edge_attr_raw = torch.tensor(
+        np.stack([corr_vals, bind_vals] + ([bind2_vals] if bind2_dict is not None else []), axis=1),
+        dtype=torch.float32,
+    )
 
     y_tensor = torch.tensor(y_np, dtype=torch.float32)
 
@@ -663,6 +966,8 @@ def load_data(
     data.tf_indices = tf_indices
     data.expr_dim = expr_np.shape[1]
     data.edge_norm_stats = edge_norm_stats
-    data.edge_attr_norm = torch.tensor(EF_norm, dtype=torch.float32)
+    # CHANGED [A11-wire-edge-norm]: raw kept for inspection; model reads normalised edge_attr
+    # ORIGINAL: data.edge_attr_norm = torch.tensor(EF_norm, dtype=torch.float32)
+    data.edge_attr_raw = edge_attr_raw
 
     return data
