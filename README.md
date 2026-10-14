@@ -112,6 +112,7 @@ The test pair CSV must contain:
 Gene1,Gene2
 GeneA,GeneB
 GeneC,GeneD
+GeneE,GeneF
 ...
 ```
 
