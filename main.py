@@ -50,6 +50,88 @@ def seed_everything(seed: int = 42):
 # CHANGED [A-seed]: removed module-level seed_everything(42) / seed=42.
 # ORIGINAL: seed_everything(42); seed = 42
 
+
+def _feature_slices(model, text_dim: int = 384) -> dict:
+    """GO / text node slices and edge columns (same layout as group SHAP)."""
+    x = model.data.x
+    expr_dim = int(model.data.expr_dim)
+    use_tf = True
+    trailing = 1 + 1 + text_dim
+    go_dim = int(x.size(1) - expr_dim - trailing)
+    if go_dim <= 0:
+        trailing = 1 + text_dim
+        go_dim = int(x.size(1) - expr_dim - trailing)
+        use_tf = False
+    if go_dim <= 0:
+        raise RuntimeError(
+            f"cannot infer GO dim: x={tuple(x.shape)} expr_dim={expr_dim}"
+        )
+    go_start = expr_dim
+    go_end = go_start + go_dim
+    text_start = go_end + 1 + (1 if use_tf else 0)
+    text_end = text_start + text_dim
+    if text_end != x.size(1):
+        raise RuntimeError(
+            f"slice mismatch: text_end={text_end} != x_dim={x.size(1)}"
+        )
+    ea = model.data.edge_attr
+    if ea is None or ea.size(1) < 3:
+        raise RuntimeError(
+            f"expected >=3 edge features (corr, bind, motif), got "
+            f"{None if ea is None else ea.size(1)}"
+        )
+    return {
+        "go": slice(go_start, go_end),
+        "text": slice(text_start, text_end),
+        "tf_bind_col": 1,
+        "motif_col": 2,
+    }
+
+
+def _zero_feature_blocks(x, ea, slices, ablate_go, ablate_text, ablate_tf_bind, ablate_motif):
+    if ablate_go:
+        x[:, slices["go"]] = 0
+    if ablate_text:
+        x[:, slices["text"]] = 0
+    if ablate_tf_bind:
+        ea[:, slices["tf_bind_col"]] = 0
+    if ablate_motif:
+        ea[:, slices["motif_col"]] = 0
+
+
+def apply_ablation_after_pretrain(
+    model,
+    train_subs,
+    val_subs,
+    test_subs,
+    *,
+    ablate_go: bool,
+    ablate_text: bool,
+    ablate_tf_bind: bool,
+    ablate_motif: bool,
+):
+    """Zero selected feature blocks on the full graph and all TF subgraphs."""
+    if not (ablate_go or ablate_text or ablate_tf_bind or ablate_motif):
+        return
+    slices = _feature_slices(model)
+    _zero_feature_blocks(
+        model.data.x, model.data.edge_attr, slices,
+        ablate_go, ablate_text, ablate_tf_bind, ablate_motif,
+    )
+    for bag in (train_subs, val_subs, test_subs):
+        for sub in bag.values():
+            _zero_feature_blocks(
+                sub["x"], sub["edge_attr"], slices,
+                ablate_go, ablate_text, ablate_tf_bind, ablate_motif,
+            )
+    print(
+        f"[ABLATION-STAGE-B] zeroed after Stage A: "
+        f"go={ablate_go} text={ablate_text} "
+        f"tf_bind={ablate_tf_bind} motif={ablate_motif}",
+        flush=True,
+    )
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="Run GraphTransformer: load → pretrain → finetune → evaluate"
@@ -72,6 +154,8 @@ def parse_args():
                    help="Optional gene text descriptions CSV (text_description.csv)")
     p.add_argument("--no_tf_indicator", action="store_true",
                    help="Ablate TF-identity node feature shortcut (use_tf_indicator=False)")
+    p.add_argument("--no_pos_emb", action="store_true",
+                   help="Disable hop positional encoding (concat zeros of same width)")
     p.add_argument("--ablate_go", action="store_true",
                    help="Zero GO multi-hot node features")
     p.add_argument("--ablate_text", action="store_true",
@@ -82,6 +166,12 @@ def parse_args():
                    help="Zero motif-score edge features")
     p.add_argument("--expr_only", action="store_true",
                    help="Keep expression (+degree/TF-id); zero GO, text, TF-bind, motif")
+    p.add_argument(
+        "--ablate_after_pretrain",
+        action="store_true",
+        help="Run full Stage A with all features, then zero --ablate_* / --expr_only "
+             "blocks only for Stage B (and eval). Complementary to full leave-one-out.",
+    )
     p.add_argument("--corr_threshold", type=float, default=0.1)
     p.add_argument("--max_epochs",     type=int,   default=1000)
     p.add_argument("--patience",       type=int,   default=5)
@@ -189,6 +279,9 @@ def main():
     base_name = infer_base_name(args.expr_path, args.label_path, args.tf_path, args.base_name)
     print(f"[INFO] Base name: {base_name}")
 
+    # If --ablate_after_pretrain: keep features for Stage A; zero later.
+    _defer = bool(args.ablate_after_pretrain)
+
     # Build model (GraphTransformer loads data internally)
     model = GraphTransformer(
         args.expr_path,
@@ -206,13 +299,14 @@ def main():
         tf_bind2_path=args.tf_bind2_path,
         anno_csv_path=args.anno_csv_path,
         use_tf_indicator=not args.no_tf_indicator,
+        use_pos_emb=not args.no_pos_emb,
         conv_type=args.conv_type,
         freeze_split_path=args.freeze_split_path,
         input_noise_std=args.input_noise_std,
-        ablate_go=bool(args.ablate_go or args.expr_only),
-        ablate_text=bool(args.ablate_text or args.expr_only),
-        ablate_tf_bind=bool(args.ablate_tf_bind or args.expr_only),
-        ablate_motif=bool(args.ablate_motif or args.expr_only),
+        ablate_go=bool((args.ablate_go or args.expr_only) and not _defer),
+        ablate_text=bool((args.ablate_text or args.expr_only) and not _defer),
+        ablate_tf_bind=bool((args.ablate_tf_bind or args.expr_only) and not _defer),
+        ablate_motif=bool((args.ablate_motif or args.expr_only) and not _defer),
     ).to(device)
 
     if args.init_ckpt:
@@ -230,7 +324,9 @@ def main():
           f"max_nodes_tf={args.max_nodes_tf} "
           f"mask_ratio={args.mask_ratio} w_mse={args.w_mse} w_pcc={args.w_pcc} w_mae={args.w_mae} "
           f"skip_pretrain={args.skip_pretrain} linear_probe={args.linear_probe} "
-          f"tf_indicator={not args.no_tf_indicator} freeze_split={args.freeze_split_path} "
+          f"tf_indicator={not args.no_tf_indicator} pos_emb={not args.no_pos_emb} "
+          f"ablate_after_pretrain={args.ablate_after_pretrain} "
+          f"freeze_split={args.freeze_split_path} "
           f"input_noise_std={args.input_noise_std} "
           f"label_frac={args.label_frac} n_shot_pos={args.n_shot_pos} "
           f"w_bce={args.w_bce} w_ap={args.w_ap} w_pairauc={args.w_pairauc} pair_cap={args.pair_cap} "
@@ -287,6 +383,15 @@ def main():
         label_frac=args.label_frac,
         n_shot_pos=args.n_shot_pos,
     )
+
+    if args.ablate_after_pretrain:
+        apply_ablation_after_pretrain(
+            model, train_subs, val_subs, test_subs,
+            ablate_go=bool(args.ablate_go or args.expr_only),
+            ablate_text=bool(args.ablate_text or args.expr_only),
+            ablate_tf_bind=bool(args.ablate_tf_bind or args.expr_only),
+            ablate_motif=bool(args.ablate_motif or args.expr_only),
+        )
 
     # ─────────────── Stage B: Fine-tuning edges ───────────────
     if hasattr(model, "classifier"):

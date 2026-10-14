@@ -53,9 +53,12 @@ class GraphTransformer(nn.Module):
         ablate_text: bool = False,
         ablate_tf_bind: bool = False,
         ablate_motif: bool = False,
+        use_pos_emb: bool = True,
     ):
         super().__init__()
         self.seed = int(seed)
+        self.use_pos_emb = bool(use_pos_emb)
+        self.hidden_dim = int(hidden_dim)
         # CHANGED [A10-cuda-rng]: was device="cuda" always → crash on CPU.
         # ORIGINAL: self.rng = torch.Generator(device="cuda").manual_seed(self.seed)
         _rng_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -116,6 +119,11 @@ class GraphTransformer(nn.Module):
         num_nodes     = self.data.x.size(0)
         orig_feat_dim = self.data.x.size(1)
         self.pos_emb  = nn.Embedding(POS_HOP_BUCKETS, hidden_dim)
+        if not self.use_pos_emb:
+            # Keep embedding module for checkpoint compat, but do not use it.
+            for p in self.pos_emb.parameters():
+                p.requires_grad = False
+            print("[ABLATION] positional encoding disabled (hop PE → zeros)")
 
         # ── 3) Input & edge dims ───────────────────────────────────────────────
         in_dim   = orig_feat_dim + hidden_dim
@@ -214,8 +222,12 @@ class GraphTransformer(nn.Module):
 
     def _encode(self, x, edge_index, edge_attr, training: bool):
         device = x.device
-        idx = self._pos_ids(x)
-        p   = self.pos_emb(idx)
+        if self.use_pos_emb:
+            idx = self._pos_ids(x)
+            p = self.pos_emb(idx)
+        else:
+            # Same concat width as full model; PE channels are identically zero.
+            p = torch.zeros(x.size(0), self.hidden_dim, device=device, dtype=x.dtype)
         x   = torch.cat([x, p], dim=1)
         h   = self.node_lin(x)
 
