@@ -23,8 +23,11 @@ Data/yeast_grnformer/
 Results/*
 !Results/mHSC-GM_Non_specific_CHIP_tf1000_prediction.csv
 !Results/mHSC-GM_Non_specific_CHIP_tf1000_prediction_metrics.csv
+!Results/mHSC-GM_Non_specific_CHIP_tf1000_prediction_metrics_imbalanced.csv
 !Results/mHSC-GM_Non_specific_CHIP_tf500_prediction.csv
 !Results/mHSC-GM_Non_specific_CHIP_tf500_prediction_metrics.csv
+!Results/mHSC-GM_Non_specific_CHIP_tf500_prediction_metrics_imbalanced.csv
+!Results/main42_split_population_counts.csv
 
 # Root-level generated / local artifacts
 gene_go_pairs.csv
@@ -54,6 +57,7 @@ scripts/*
 !scripts/build_yeast_motif_priors.py
 !scripts/fetch_yeast_genome_reference.py
 !scripts/run_main42_fullcoexp.py
+!scripts/count_split_populations.py
 
 # Logs and editor
 *.log

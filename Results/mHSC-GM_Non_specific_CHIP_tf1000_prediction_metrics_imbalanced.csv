@@ -1,0 +1,4 @@
+Metric,Value
+ROC AUC (imbalanced),0.8894
+AUPRC (imbalanced),0.3625
+F1 @ thr (imbalanced),0.3895
